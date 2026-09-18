@@ -57,14 +57,6 @@ interface ProtocolSubscription {
   readonly propagateErrors: boolean;
 }
 
-interface ProtocolTransformSubscription {
-  readonly key: object;
-  readonly owner: BrowserProviderScope | null;
-  readonly order: number;
-  readonly callback: (frame: ProtocolFrame) => unknown;
-  readonly propagateErrors: boolean;
-}
-
 interface EventEntry {
   readonly target: EventTarget;
   readonly type: string;
@@ -99,8 +91,6 @@ interface AdapterHostDiagnostics {
   readonly protocolDecodeCount: number;
   readonly protocolDispatchCount: number;
   readonly protocolSubscriberCount: number;
-  readonly protocolTransformCount: number;
-  readonly protocolTransformerCount: number;
 }
 
 interface BrowserKernelTransport {
@@ -111,14 +101,6 @@ interface BrowserKernelTransport {
 
 interface BrowserProviderInstaller {
   (): void | (() => void);
-}
-
-interface BrowserManagedContributionContext {
-  readonly onHit: () => void;
-}
-
-interface BrowserManagedContributionFactory {
-  (context: BrowserManagedContributionContext): ManagedBrowserContribution;
 }
 
 interface BrowserProviderDefinition {
@@ -149,7 +131,6 @@ interface BrowserProviderState {
   readonly applications: Set<symbol>;
   readonly enabledCallbacks: Set<(enabled: boolean, reason: string) => void>;
   readonly lifecycleCallbacks: Set<(enabled: boolean) => void>;
-  readonly managedFactories: Map<string, BrowserManagedContributionFactory>;
   scope: BrowserProviderScope | null;
   enabled: boolean | null;
   installed: boolean;
@@ -255,12 +236,6 @@ function isMobileSidebarTouchScrollContribution(contribution: BoundContribution)
     declaration.target === BUILTIN_BROWSER_TARGETS.mobileSidebarTouchScroll;
 }
 
-function isWindowControlsOverlayContribution(contribution: BoundContribution): boolean {
-  const declaration = contribution.declaration as { readonly target?: unknown };
-  return contribution.adapter === BASE_ADAPTERS.runtimeView &&
-    declaration.target === BUILTIN_BROWSER_TARGETS.windowControlsOverlay;
-}
-
 function installMobileSidebarTouchScrollContribution(
   state: BrowserProviderState,
   onHit: () => void,
@@ -313,11 +288,9 @@ let eventDispatchCount = 0;
 let hookInvocationCount = 0;
 let protocolDecodeCount = 0;
 let protocolDispatchCount = 0;
-let protocolTransformCount = 0;
 let eventTargetSequence = 0;
 const protocolChannelTokens = new WeakSet<object>();
 const protocolSubscriptions = new Map<ProtocolChannelRef, Map<object, ProtocolSubscription>>();
-const protocolTransformSubscriptions = new Map<ProtocolChannelRef, Map<object, ProtocolTransformSubscription>>();
 
 function ownProviderDisposer(dispose: () => void): () => void {
   const scope = window.__OpenCodexCurrentProviderScope;
@@ -535,7 +508,6 @@ function defineProtocolChannel(id: string): ProtocolChannelRef {
   const channel = Object.freeze({ id });
   protocolChannelTokens.add(channel);
   protocolSubscriptions.set(channel, new Map());
-  protocolTransformSubscriptions.set(channel, new Map());
   return channel;
 }
 
@@ -735,33 +707,6 @@ function decodeProtocolValue(raw: unknown): unknown {
   }
 }
 
-function createProtocolFrame(
-  raw: unknown,
-  metadata: Readonly<Record<string, unknown>> = {},
-): ProtocolFrame {
-  let decoded = false;
-  let decodedValue: unknown;
-  const decodeOnce = () => {
-    if (!decoded) {
-      decodedValue = decodeProtocolValue(raw);
-      decoded = true;
-    }
-    return decodedValue;
-  };
-  return Object.freeze(Object.defineProperties({}, {
-    raw: { enumerable: true, value: raw },
-    metadata: { enumerable: true, value: Object.freeze({ ...metadata }) },
-    value: {
-      enumerable: true,
-      get: decodeOnce,
-    },
-    decode: {
-      enumerable: false,
-      value: decodeOnce,
-    },
-  })) as ProtocolFrame;
-}
-
 function observeProtocol(input: {
   key: object;
   channel: ProtocolChannelRef;
@@ -785,67 +730,6 @@ function observeProtocol(input: {
   });
 }
 
-function transformProtocol(input: {
-  key: object;
-  channel: ProtocolChannelRef;
-  order?: number;
-  propagateErrors?: boolean;
-  callback: (frame: ProtocolFrame) => unknown;
-}): () => void {
-  if (!protocolChannelTokens.has(input.channel as object)) throw new TypeError("协议转换必须引用宿主 Channel 对象");
-  if (!input.key || typeof input.callback !== "function") throw new TypeError("协议转换声明不完整");
-  const subscriptions = protocolTransformSubscriptions.get(input.channel);
-  if (!subscriptions) throw new TypeError("协议 Channel 未注册");
-  const order = Number(input.order || 0);
-  if (!Number.isFinite(order)) throw new TypeError("协议转换顺序必须是有限数字");
-  subscriptions.set(input.key, {
-    key: input.key,
-    owner: window.__OpenCodexCurrentProviderScope || null,
-    order,
-    callback: input.callback,
-    propagateErrors: input.propagateErrors === true,
-  });
-  let active = true;
-  return ownProviderDisposer(() => {
-    if (!active) return;
-    active = false;
-    subscriptions.delete(input.key);
-  });
-}
-
-function processProtocol(input: {
-  channel: ProtocolChannelRef;
-  value: unknown;
-  metadata?: Readonly<Record<string, unknown>>;
-}): unknown {
-  if (!protocolChannelTokens.has(input.channel as object)) throw new TypeError("协议转换必须引用宿主 Channel 对象");
-  const subscriptions = protocolTransformSubscriptions.get(input.channel);
-  if (!subscriptions) throw new TypeError("协议 Channel 未注册");
-  if (subscriptions.size === 0) return input.value;
-
-  let currentValue = input.value;
-  let currentFrame = createProtocolFrame(currentValue, input.metadata);
-  const ordered = [...subscriptions.values()].sort((left, right) => left.order - right.order);
-  for (const subscription of ordered) {
-    try {
-      protocolTransformCount += 1;
-      const transformed = runInProviderScope(
-        subscription.owner,
-        () => subscription.callback(currentFrame),
-      );
-      // undefined 明确表示“保持原值”，避免只观察消息的转换器意外改变传输形态。
-      if (transformed !== undefined && transformed !== currentValue) {
-        currentValue = transformed;
-        currentFrame = createProtocolFrame(currentValue, input.metadata);
-      }
-    } catch (error) {
-      if (subscription.propagateErrors) throw error;
-      console.warn("[opencodex-adapter] protocol transformer failed", error);
-    }
-  }
-  return currentValue;
-}
-
 function publishProtocol(input: {
   channel: ProtocolChannelRef;
   value: unknown;
@@ -855,7 +739,27 @@ function publishProtocol(input: {
   const subscriptions = protocolSubscriptions.get(input.channel);
   if (!subscriptions) throw new TypeError("协议 Channel 未注册");
   protocolDispatchCount += 1;
-  const frame = createProtocolFrame(input.value, input.metadata);
+  let decoded = false;
+  let decodedValue: unknown;
+  const decodeOnce = () => {
+    if (!decoded) {
+      decodedValue = decodeProtocolValue(input.value);
+      decoded = true;
+    }
+    return decodedValue;
+  };
+  const frame = Object.freeze(Object.defineProperties({}, {
+    raw: { enumerable: true, value: input.value },
+    metadata: { enumerable: true, value: Object.freeze({ ...(input.metadata || {}) }) },
+    value: {
+      enumerable: true,
+      get: decodeOnce,
+    },
+    decode: {
+      enumerable: false,
+      value: decodeOnce,
+    },
+  })) as ProtocolFrame;
   const results: unknown[] = [];
   for (const subscription of [...subscriptions.values()]) {
     try {
@@ -959,7 +863,6 @@ function createBrowserProviderRegistry() {
       applications: new Set(),
       enabledCallbacks: new Set(),
       lifecycleCallbacks: new Set(),
-      managedFactories: new Map(),
       scope: null,
       enabled: null,
       installed: false,
@@ -1062,7 +965,6 @@ function createBrowserProviderRegistry() {
     state.scope?.close();
     state.scope = null;
     state.installed = false;
-    state.managedFactories.clear();
     let firstError: unknown = null;
     for (const dispose of state.disposers.splice(0).reverse()) {
       try {
@@ -1137,21 +1039,6 @@ function createBrowserProviderRegistry() {
             if (isMobileSidebarTouchScrollContribution(contribution)) {
               const managed = installMobileSidebarTouchScrollContribution(state, () => emit(contribution.point.id));
               managedContributions.set(contribution.key, managed);
-            }
-            if (isWindowControlsOverlayContribution(contribution)) {
-              const factory = state.managedFactories.get(contribution.point.id);
-              if (!factory) throw new Error("PWA 标题栏 Provider 没有注册托管 Contribution 工厂");
-              // 工厂也在当前 Provider scope 中运行，DOM 监听、计时器等资源因此归属于同一页面代际。
-              try {
-                const managed = runInProviderScope(state.scope, () => factory({
-                  onHit: () => emit(contribution.point.id),
-                }));
-                managedContributions.set(contribution.key, managed);
-              } catch (error) {
-                // 工厂可能已申请部分共享资源；apply 失败时立即释放，不能等待下一次页面切换兜底。
-                releaseStateResources(state);
-                throw error;
-              }
             }
             state.applications.add(contribution.key);
             reporter.applied(contribution);
@@ -1239,25 +1126,6 @@ function createBrowserProviderRegistry() {
     state.installers.push(installer);
   }
 
-  function registerManaged(
-    key: string,
-    pointAlias: string,
-    factory: BrowserManagedContributionFactory,
-  ): void {
-    const state = stateByKey.get(String(key || ""));
-    if (!state) throw new TypeError(`未知浏览器 Provider key：${key}`);
-    const pointId = state.definition.points[String(pointAlias || "")];
-    if (!pointId) throw new TypeError(`浏览器 Provider ${key} 没有修改点别名：${pointAlias}`);
-    if (typeof factory !== "function") throw new TypeError(`浏览器 Provider ${key} 缺少托管工厂`);
-    if (window.__OpenCodexCurrentProviderScope !== state.scope || !state.installing) {
-      throw new Error(`浏览器 Provider ${key} 只能在安装阶段注册托管工厂`);
-    }
-    if (state.managedFactories.has(pointId)) {
-      throw new Error(`浏览器 Provider ${key} 重复注册托管工厂：${pointAlias}`);
-    }
-    state.managedFactories.set(pointId, factory);
-  }
-
   function beginPage(root: Element | null): void {
     if (pageRoot === root) return;
     if (pageRoot) transport()?.beginGeneration?.();
@@ -1281,7 +1149,6 @@ function createBrowserProviderRegistry() {
         console.warn("[opencodex-adapter] browser Provider cleanup failed", state.definition.key, error);
       }
       state.installers.splice(0);
-      state.managedFactories.clear();
       state.enabled = null;
       state.enabledCallbacks.clear();
       state.installing = false;
@@ -1319,7 +1186,7 @@ function createBrowserProviderRegistry() {
     return activationPromise;
   }
 
-  return Object.freeze({ beginPage, register, registerManaged, activate });
+  return Object.freeze({ beginPage, register, activate });
 }
 
 const browserProviders = createBrowserProviderRegistry();
@@ -1335,11 +1202,6 @@ function diagnostics(): AdapterHostDiagnostics {
     protocolDecodeCount,
     protocolDispatchCount,
     protocolSubscriberCount: [...protocolSubscriptions.values()].reduce((total, entries) => total + entries.size, 0),
-    protocolTransformCount,
-    protocolTransformerCount: [...protocolTransformSubscriptions.values()].reduce(
-      (total, entries) => total + entries.size,
-      0,
-    ),
   });
 }
 
@@ -1347,13 +1209,7 @@ const adapterHost = Object.freeze({
   dom: Object.freeze({ observe: observeDom }),
   events: Object.freeze({ observe: observeEvent }),
   hooks: Object.freeze({ around: installAroundHook }),
-  protocol: Object.freeze({
-    channels: protocolChannels,
-    observe: observeProtocol,
-    process: processProtocol,
-    publish: publishProtocol,
-    transform: transformProtocol,
-  }),
+  protocol: Object.freeze({ channels: protocolChannels, observe: observeProtocol, publish: publishProtocol }),
   lifecycle: Object.freeze({ createScope: createBrowserResourceScope }),
   plugins: Object.freeze({ register: registerOwnedPlugin }),
   scheduler: Object.freeze({ capture: captureProviderScheduler }),

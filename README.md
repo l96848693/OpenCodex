@@ -1,217 +1,244 @@
 # OpenCodex
 
-**中文** | [English](docs/README_EN.md)
+**公开版本：v3.0.0** · [源码仓库](https://github.com/l96848693/OpenCodex) · [AGPL-3.0 许可证](LICENSE)
 
-OpenCodex 是一个 Codex 桌面运行时中间层，同时兼容旧版 Codex Desktop 和新版 ChatGPT Desktop。它可以让你直接使用手机、平板或另一台电脑通过浏览器访问并操作目标机器上的 Codex，让你可以随时随地 AI Coding。
+**繁體中文（粵語）** | [简体中文](docs/README_CN.md) | [English](docs/README_EN.md) | [版本消息](docs/NEWS.md)
 
----
-天塌了😭刚准备开源，谁知道一觉醒来 ChatGPT App 就对 Codex 做了支持。
-
-但对比官方还是有一些使用场景上的优势：
-
-1. 无需魔法上网。
-2. 无需外区Google Play/苹果账号，且支持三方API登录的远程使用
-3. 支持 Codex 的完整功能，例如文件树、终端、审查等，便于随时随地 AI Coding。
-4. 自由搭配内网穿透/公网，无需经过官方中继服务器，速度快且数据易于保护隐私数据。
+OpenCodex 係一層連接 Codex 桌面運行時同瀏覽器嘅中間層，兼容舊版 Codex Desktop 同新版 ChatGPT Desktop。你可以用手機、平板或者另一部電腦，透過瀏覽器操作目標電腦上嘅 Codex，唔使長期坐喺電腦前面都可以繼續 AI Coding。
 
 ---
 
-## 特性
+ChatGPT App 對大陸 Android 生態唔友好，所以我決定企喺巨人膊頭上，繼續搞好呢個 project。
 
-- 通过浏览器访问目标机器上的 Codex，无需魔法网络和账号，支持手机、平板、电脑等多种设备。
-- 原汁原味Codex使用体验。
-- 支持本机访问、局域网访问和配合 Tailscale / ZeroTier / VPN 的远程局域网访问。
-- 支持设置访问密码，避免无认证暴露。
-- 提供桌面启动器，可可视化配置监听地址、端口和访问密码等。
-- 支持显示真实token消耗情况、项目和会话根据最近更新排序等
-- 支持**智能调度**，模型选择Auto时自动根据任务选择模型和推理强度以节省token，并且支持根据使用场景自定义档位。
-- 启动时会自动跟随本地 Codex/ChatGPT Desktop 运行时版本，自动兼容新版本功能。
-- 提供针对移动端提供的优化。
+同官方方案相比，OpenCodex 仲有幾個幾實用嘅場景：
 
-<p align="center">
-  <img src="docs/image/start.jpg" alt="OpenCodex start" width="23%" />
-  &nbsp;
-  <img src="docs/image/settings.jpg" alt="OpenCodex settings" width="23%" />
-  &nbsp;
-  <img src="docs/image/home.jpg" alt="OpenCodex home" width="23%" />
-  &nbsp;
-  <img src="docs/image/new.jpg" alt="OpenCodex new session" width="23%" />
-</p>
+1. 原作者版本嚮我部 Samsung 上體驗唔好，所以整咗個獨立 Mobile Web 頁面，唔再將桌面三欄畫面塞入手機。
+2. 唔需要外區 Google Play／Apple 帳號，亦支援用第三方 API 登入後遠端使用。
+3. PC Web 保留 Codex 原有體驗，包括檔案樹、終端同審查等能力。
+4. 可以自由配合 Tailscale、ZeroTier、VPN 或內網穿透，唔經官方中繼，速度同私隱都更容易由自己控制。
 
-## 环境要求
+---
 
-- Node环境
+## 功能特色
+
+- 用瀏覽器操作目標電腦上嘅 Codex，支援手機、平板同電腦。
+- PC Web 保留原汁原味嘅 Codex 使用體驗。
+- 提供獨立 `/mobile/` 頁面，針對窄屏、觸控、軟鍵盤同橫豎屏重新設計。
+- 支援本機、局域網，同配合 Tailscale／ZeroTier／VPN 嘅遠端局域網存取。
+- 支援存取密碼，避免未經認證直接打開服務。
+- 提供桌面啟動器，可以設定監聽地址、端口同密碼。
+- 移動版支援項目同 session 瀏覽、turn 分頁、流式 item、停止任務、附件同連線狀態。
+- Gateway 同官方 Electron runtime 保持隔離，唔會修改官方安裝目錄。
+- 內置 Plugin SDK v2；PC Web 可以載入內置或外部 ESM 插件。
+- 實際測試範圍主要係 Windows Gateway、Android Mobile Web，以及 Samsung Galaxy S20／S20 Ultra；本版本亦針對呢幾類環境強化穩定性。
+- macOS、Safari（包括 iOS Safari）同其他 Apple 原生瀏覽器目前未有測試，因此唔保證兼容性。
+
+## 環境要求
+
+- Node.js
 - pnpm
-- 本机已安装旧版 Codex Desktop 或包含 Codex 的新版 ChatGPT Desktop（无需启动，但也支持同时使用）。
-- macOS/Windows/Linux(需要命令行启动，具体见下方文档)
+- 本機已安裝舊版 Codex Desktop，或者包含 Codex 嘅新版 ChatGPT Desktop；唔需要預先啟動，亦可以同 OpenCodex 一齊使用。
+- Windows／macOS／Linux；Linux 暫時需要用命令行啟動。
 
-## 如何使用
+## 點樣使用
 
-### 桌面启动器
+### 桌面啟動器
 
-下载安装：
-
-提供2种下载渠道：
-- [Release](https://github.com/RyensX/OpenCodex/releases): 正式版本，较为稳定，推荐使用
-- [Artifacts](https://github.com/RyensX/OpenCodex/actions): 测试版本，push 时 CI 自动打包，可用于尝鲜新功能。注意下载Artifacts需要登录Github
-
-macOS 首次启动遇到安全提示时，请参考：
-- [macOS 首次启动授权指南](docs/macos-installation.zh.md)
-
-本地调试：
+由 Release 頁面下載安裝包，或者喺本地執行：
 
 ```bash
 pnpm install
-```
-
-```bash
 pnpm run launcher:dev
 ```
 
-生成 macOS 安装包：
+建立安裝包：
 
 ```bash
 pnpm run launcher:dist:mac
-```
-
-生成 Windows 安装包：
-
-```bash
 pnpm run launcher:dist:win
 ```
 
-产物会输出到 `release/`。首次启动会随机选择一个可用端口，修改监听地址、端口或访问密码后会自动重启服务让配置生效。
+輸出會放喺 `release/`。第一次啟動會揀一個可用端口；修改監聽地址、端口或者存取密碼之後，Launcher 會重啟 Gateway 令設定生效。
 
-> 使用前需要本机已安装旧版 Codex Desktop 或新版 ChatGPT Desktop。
+### 命令行啟動
 
-### 命令行启动
+Bash／macOS／Linux：
 
-如果只是临时调试，也可以通过命令行启动：
-
-局域网：
 ```bash
 pnpm install
-PORT=3737 pnpm run web:dev
+HOST=127.0.0.1 PORT=3737 pnpm run web:dev
 ```
 
-支持远程访问：
-```bash
+Windows PowerShell 唔可以直接照抄上面嘅 Bash 環境變數寫法，要用：
+
+```powershell
 pnpm install
-HOST=0.0.0.0 PORT=3737 pnpm run web:dev
+$env:HOST = "127.0.0.1"
+$env:PORT = "3737"
+pnpm run web:dev
 ```
 
-`强烈建议设置访问密码和修改端口`。可以复制示例配置后编辑其中的密码：
+如果要俾手機經局域網或者 Tailscale 存取：
+
+```powershell
+$env:HOST = "0.0.0.0"
+$env:PORT = "39289"
+pnpm run web:dev
+```
+
+第一次執行會先編譯，再準備官方 Electron runtime。見到 `Gateway listening` 先代表服務真係可以用；只見到 `esbuild`、下載進度或者 `retrying`，都未算啟動完成。
+
+可以用 PowerShell 檢查端口同健康狀態：
+
+```powershell
+Get-NetTCPConnection -State Listen -LocalPort 3737 -ErrorAction SilentlyContinue
+Invoke-RestMethod http://127.0.0.1:3737/api/health | Select-Object ok,gateway
+```
+
+啟動後打開：
+
+```text
+PC Web：http://127.0.0.1:3737/
+Mobile Web：http://127.0.0.1:3737/mobile/
+```
+
+### 設定存取密碼
+
+強烈建議設定密碼，遠端使用時亦建議改端口。先複製設定檔：
 
 ```bash
 cp config.example.yaml config.yaml
 ```
 
-配置示例：
-
 ```yaml
 auth:
-  password: "你的密码"
+  password: "你嘅密碼"
 ```
 
-启动后访问：
+### 停止調試服務
 
-```text
-http://127.0.0.1:3737
+`pnpm run web:dev` 會喺目前終端前台運行。要關閉就返去嗰個終端按 `Ctrl+C`，唔需要另外執行停止命令。
+
+同一部電腦建議一次只開一個 OpenCodex Gateway。3737 開發環境同 39289 測試環境就算端口唔同，仍然可能共用官方 Electron runner 快取；第二個 Gateway 會報 `ERR_OPENCODEX_RUNTIME_IN_USE`。要換環境，先正常停止原本嘅 Gateway，唔好結束官方 Codex 進程，更加唔好直接刪 runtime 快取。
+
+如果原本嘅終端已經關閉，可以先精確搵出本項目嘅 dev runner，再決定係咪停止：
+
+```powershell
+$runner = Get-CimInstance Win32_Process | Where-Object {
+  $_.Name -eq "node.exe" -and $_.CommandLine -like "*OpenCodex*gateway\dev\run-gateway.cjs*"
+}
+$runner | Select-Object ProcessId,CommandLine
+$runner | ForEach-Object { Stop-Process -Id $_.ProcessId }
 ```
 
-### Linux使用
+### Linux 使用
 
-无预打包好的启动器，建议命令行使用，具体见 [配置步骤](docs/LINUX_GUIDE.md)
+Linux 暫時未提供預先打包嘅 Launcher，建議跟住 [Linux 設定指南](docs/LINUX_GUIDE.md) 用命令行啟動。
 
-### 远程访问
+### 遠端存取
 
-OpenCodex本身不提供远程访问服务，如果需要在其他设备中远程访问，请使用Tailscale、ZeroTier、Cloudflare Tunnel、企业自建 VPN 等方式搭建网络，然后在启动器中打开局域网模式进行访问。
+OpenCodex 本身唔提供遠端網絡服務。如果要喺其他裝置存取，可以用 Tailscale、ZeroTier、Cloudflare Tunnel 或公司自建 VPN，再喺 Launcher 開啟局域網模式。
 
-> 也可以使用公网，但不建议把 OpenCodex 直接暴露到公网，还是推荐上述工具，更加安全可控
+可以直接暴露到公網，但唔建議咁做。用受控網絡同存取密碼會安全得多。
 
-## 常用环境变量
+## Mobile Web 行為
 
-| 变量 | 默认值 | 说明 |
+- 第一次打開 session 會載入最新 5 個 turn，由舊到新排列，並定位到最底部最新內容。
+- 喺歷史頂部繼續向下拉，可以每次再載入 5 個較舊 turn，最多自動展示 50 個。
+- 特別長嘅 item 唔會直接截斷；頁面會提供「載入更多」。
+- 官方桌面仍在執行嘅 turn，Mobile Web 會顯示「流式中」並繼續接收最新 item。
+- 流式期間發送按鈕會變成停止按鈕；停止目前任務之前會再確認，避免誤觸。
+- Web 連續離線 5 分鐘會釋放 Web lease，但唔會中斷官方後台正在做嘅 turn。重新連線後，如果冇其他瀏覽器接管，就可以重新取得操作權。
+
+## 常用環境變數
+
+| 變數 | 預設值 | 說明 |
 | --- | --- | --- |
-| `HOST` | `0.0.0.0` | 命令行 gateway 监听地址。 |
-| `PORT` | `3737` | 命令行 gateway 监听端口。 |
-| `OPENCODEX_HOST` | `127.0.0.1` | Launcher 首次启动 gateway 时使用的默认监听地址。 |
-| `OPENCODEX_PORT` | 随机可用端口 | Launcher 首次启动 gateway 时使用的默认端口。 |
-| `OPENCODEX_PREFERRED_LANGUAGES` | `zh-CN` | OpenCodex 自有界面语言首选列表，支持 JSON 数组或逗号分隔，例如 `["zh-Hans-CN","en-CN"]`。Launcher 会自动传入系统首选语言。 |
-| `OPENCODEX_PLUGIN_DIRS` | 空 | 外部插件根目录，结构需与 `web-shell/plugins` 一致；多个目录可用系统路径分隔符或 JSON 数组传入。 |
-| `OPENCODEX_LOG_MAX_MB` | `10` | Launcher 写入的 `gateway.log` 单文件大小上限，单位 MB；最多额外保留一个 `gateway.log.old`。 |
-| `CODEX_WEB_CONFIG_PATH` | `config.yaml` | gateway 认证配置文件路径。 |
-| `CODEX_WEB_AUTH_TOKEN_TTL_MS` | `43200000` | gateway 访问 token 有效期，默认 12 小时。 |
-| `CODEX_WEB_DEBUG` | 空 | 设为 `1` 或 `true` 后输出更多调试日志。 |
-| `CODEX_WEB_SLOW_LOG_MS` | `750` | IPC 慢调用日志阈值，单位毫秒。 |
-| `CODEX_WEB_LOCAL_FILE_TOKEN_TTL_MS` | `300000` | 本地文件预览 URL token 有效期，单位毫秒。 |
-| `CODEX_DESKTOP_APP_PATH` | 自动扫描 | 指定 Codex/ChatGPT Desktop 安装路径或 `app.asar` 所在路径。 |
-| `CODEX_DESKTOP_EXECUTABLE_PATH` | 自动扫描 | Windows/Linux 下指定 Codex/ChatGPT Desktop Electron 可执行文件路径。 |
-| `CODEX_APP_SERVER_BINARY_PATH` | 自动扫描 | Windows 下指定 Codex app-server/CLI 可执行文件路径。 |
-| `CODEX_CLI_PATH` | 自动扫描 | Windows 下指定 Codex CLI 可执行文件路径。 |
-| `CODEX_WEB_RUNTIME_DIR` | `.data/runtime` | 命令行 gateway 运行目录；打包态由 Launcher 指向用户数据目录。 |
-| `CODEX_WEB_OFFICIAL_BUNDLE_DIR` | `.data/cache/codex-official-bundle` | 指定官方 bundle 解包缓存目录。 |
-| `CODEX_WEB_OFFICIAL_AUTO_SCAN_UPGRADE` | `1` | 控制是否在启动时自动扫描官方 Codex 运行时更新；设为 `0` 后优先复用现有缓存，仅在缓存缺失或不可用时扫描。 |
-| `CODEX_WEB_OFFICIAL_USER_DATA_DIR` | `.data/official-user-data` | 指定官方 Electron profile 隔离目录。 |
-| `CODEX_WEB_OFFICIAL_TMPDIR` / `CODEX_WEB_OFFICIAL_TMP_DIR` | 自动生成 | 指定官方 hidden runtime 的临时目录，用于隔离官方 IPC socket。 |
-| `CODEX_WEB_REPORTS_DIR` | `.data/reports` | gateway 诊断报告输出目录。 |
-| `CODEX_WEB_WORKSPACE_ROOTS` | 空 | 初始 workspace roots，多个路径用逗号分隔。 |
-| `CODEX_HOME` | `~/.codex` | Codex CLI / app-server 的配置和运行数据目录。 |
+| `HOST` | `0.0.0.0` | 命令行 Gateway 監聽地址。 |
+| `PORT` | `3737` | 命令行 Gateway 監聽端口。 |
+| `OPENCODEX_HOST` | `127.0.0.1` | Launcher 第一次啟動 Gateway 嘅預設監聽地址。 |
+| `OPENCODEX_PORT` | 隨機可用端口 | Launcher 第一次啟動 Gateway 嘅預設端口。 |
+| `OPENCODEX_PREFERRED_LANGUAGES` | `zh-CN` | OpenCodex 自有介面語言，可以用 JSON 陣列或逗號分隔。 |
+| `OPENCODEX_PLUGIN_DIRS` | 空 | 外部插件根目錄；多個目錄可以用系統路徑分隔符或者 JSON 陣列。 |
+| `OPENCODEX_LOG_MAX_MB` | `10` | `gateway.log` 單檔大小上限；最多另外保留一個 `gateway.log.old`。 |
+| `CODEX_WEB_CONFIG_PATH` | `config.yaml` | Gateway 認證設定檔路徑。 |
+| `CODEX_WEB_AUTH_TOKEN_TTL_MS` | `43200000` | Gateway 存取 token 有效期，預設 12 小時。 |
+| `CODEX_WEB_DEBUG` | 空 | 設成 `1` 或 `true` 會輸出更多調試日誌。 |
+| `CODEX_WEB_SLOW_LOG_MS` | `750` | IPC 慢調用日誌門檻，單位毫秒。 |
+| `CODEX_WEB_LOCAL_FILE_TOKEN_TTL_MS` | `300000` | 本機檔案預覽 URL token 有效期。 |
+| `CODEX_DESKTOP_APP_PATH` | 自動掃描 | Codex／ChatGPT Desktop 安裝路徑，或者 `app.asar` 所在路徑。 |
+| `CODEX_DESKTOP_EXECUTABLE_PATH` | 自動掃描 | Windows／Linux 官方 Electron 可執行檔路徑。 |
+| `CODEX_APP_SERVER_BINARY_PATH` | 自動掃描 | Windows Codex app-server／CLI 路徑。 |
+| `CODEX_CLI_PATH` | 自動掃描 | Windows Codex CLI 路徑。 |
+| `CODEX_WEB_RUNTIME_DIR` | `.data/runtime` | 命令行 Gateway 運行目錄。 |
+| `CODEX_WEB_OFFICIAL_BUNDLE_DIR` | `.data/cache/codex-official-bundle` | 官方 bundle 解包快取目錄。 |
+| `CODEX_WEB_OFFICIAL_AUTO_SCAN_UPGRADE` | `1` | 控制啟動時係咪自動掃描官方 runtime 更新。 |
+| `CODEX_WEB_OFFICIAL_USER_DATA_DIR` | `.data/official-user-data` | 隔離嘅官方 Electron profile 目錄。 |
+| `CODEX_WEB_OFFICIAL_TMPDIR` / `CODEX_WEB_OFFICIAL_TMP_DIR` | 自動產生 | Hidden runtime 臨時目錄，用嚟隔離官方 IPC socket。 |
+| `CODEX_WEB_REPORTS_DIR` | `.data/reports` | Gateway 診斷報告輸出目錄。 |
+| `CODEX_WEB_WORKSPACE_ROOTS` | 空 | 初始 workspace roots，用逗號分隔。 |
+| `CODEX_HOME` | `~/.codex` | Codex CLI／app-server 設定同運行資料目錄。 |
 
-### 高级调试环境变量
+### 進階調試環境變數
 
-| 变量 | 默认值 | 说明 |
+| 變數 | 預設值 | 說明 |
 | --- | --- | --- |
-| `CODEX_WEB_PICKED_FILES_MAX_COUNT` | `20` | Web 端临时 picked file 请求目录数量上限。 |
-| `CODEX_WEB_PICKED_FILE_MAX_BYTES` | `52428800` | 单个 picked file 大小上限，单位字节。 |
-| `CODEX_WEB_PICKED_FILES_MAX_TOTAL_BYTES` | `104857600` | picked file 临时目录总大小上限，单位字节。 |
-| `CODEX_WEB_PICKED_FILE_TTL_MS` | `86400000` | picked file 临时目录保留时间，单位毫秒。 |
-| `CODEX_WEB_DISABLE_ASSET_CACHE` | 空 | 设为 `1` 后禁用 gateway 静态资源缓存。 |
-| `CODEX_WEB_DISABLE_GZIP` | 空 | 设为 `1` 后禁用 gateway gzip 响应压缩。 |
-| `OPENCODEX_DEBUG_WS` | 空 | 设为 `1` 后启用 WebSocket/app-host 链路诊断。 |
-| `OPENCODEX_WS_LARGE_LOG_BYTES` | `262144` | WebSocket 大消息日志阈值，单位字节。 |
-| `OPENCODEX_WS_SEND_SLOW_MS` | `80` | WebSocket 发送慢日志阈值，单位毫秒。 |
-| `OPENCODEX_WS_STRINGIFY_SLOW_MS` | `20` | WebSocket JSON 序列化慢日志阈值，单位毫秒。 |
-| `OPENCODEX_WS_BUFFERED_LOG_BYTES` | `524288` | WebSocket bufferedAmount 日志阈值，单位字节。 |
-| `OPENCODEX_APP_HOST_TRAFFIC_FLUSH_MS` | `2000` | app-host 流量统计 flush 间隔，单位毫秒。 |
-| `OPENCODEX_APP_HOST_LARGE_FRAME_BYTES` | `65536` | app-host 大帧日志阈值，单位字节。 |
-| `OPENCODEX_WS_DISABLE_DEFLATE` | 空 | 设为 `1` 后关闭 WebSocket permessage-deflate。 |
-| `OPENCODEX_WS_DEFLATE_THRESHOLD` | `65536` | WebSocket 压缩启用阈值，单位字节。 |
-| `OPENCODEX_WS_DEFLATE_CONCURRENCY` | `4` | WebSocket 压缩并发限制。 |
-| `OPENCODEX_WS_DEFLATE_LEVEL` | `3` | WebSocket zlib 压缩等级。 |
+| `CODEX_WEB_PICKED_FILES_MAX_COUNT` | `20` | Web 臨時 picked-file 請求目錄上限。 |
+| `CODEX_WEB_PICKED_FILE_MAX_BYTES` | `52428800` | 單個 picked file 大小上限。 |
+| `CODEX_WEB_PICKED_FILES_MAX_TOTAL_BYTES` | `104857600` | picked-file 臨時目錄總大小上限。 |
+| `CODEX_WEB_PICKED_FILE_TTL_MS` | `86400000` | picked-file 臨時目錄保留時間。 |
+| `CODEX_WEB_DISABLE_ASSET_CACHE` | 空 | 設成 `1` 會停用 Gateway 靜態資源快取。 |
+| `CODEX_WEB_DISABLE_GZIP` | 空 | 設成 `1` 會停用 Gateway gzip。 |
+| `OPENCODEX_DEBUG_WS` | 空 | 設成 `1` 會開啟 WebSocket／AppHost 診斷。 |
+| `OPENCODEX_WS_LARGE_LOG_BYTES` | `262144` | WebSocket 大訊息日誌門檻。 |
+| `OPENCODEX_WS_SEND_SLOW_MS` | `80` | WebSocket 慢發送日誌門檻。 |
+| `OPENCODEX_WS_STRINGIFY_SLOW_MS` | `20` | WebSocket JSON 序列化慢日誌門檻。 |
+| `OPENCODEX_WS_BUFFERED_LOG_BYTES` | `524288` | WebSocket `bufferedAmount` 日誌門檻。 |
+| `OPENCODEX_APP_HOST_TRAFFIC_FLUSH_MS` | `2000` | AppHost 流量統計 flush 間隔。 |
+| `OPENCODEX_APP_HOST_LARGE_FRAME_BYTES` | `65536` | AppHost 大 frame 日誌門檻。 |
+| `OPENCODEX_WS_DISABLE_DEFLATE` | 空 | 設成 `1` 會關閉 WebSocket `permessage-deflate`。 |
+| `OPENCODEX_WS_DEFLATE_THRESHOLD` | `65536` | WebSocket 壓縮門檻。 |
+| `OPENCODEX_WS_DEFLATE_CONCURRENCY` | `4` | WebSocket 壓縮並發上限。 |
+| `OPENCODEX_WS_DEFLATE_LEVEL` | `3` | WebSocket zlib 壓縮等級。 |
 
-## 常见问题
+## 常見問題
 
-### 第一次打开会话历史为空
+### 第一次打開 session 睇唔到歷史
 
-第一次加载可能较慢，也会受到远程局域网网速影响。稍等一会后再刷新或重新进入即可。
+Mobile Web 會先讀取最新 5 個 turn。等連線狀態穩定之後，可以按「再試一次」或者重新整理；唔需要不停開新 Gateway。長 session 之後可以喺歷史頂部逐頁載入。
 
-### 会话同步不及时
+### Mobile Web 一直顯示「流式中」
 
-如果你把OpenCodex和官方Desktop同时使用，因为两者都各自维护一个会话状态，虽然是同一个数据但是可能并不会完全实时同步。
+「流式中」代表官方 App Server 仲處理緊目前 turn，唔係頁面卡死。Mobile Web 會繼續收取新 item；如果要中斷，可以按停止按鈕並確認。
 
-推荐无论是本地还是远程都直接只使用OpenCodex，可以配合PWA，体验和官方Desktop相差无几。
+### App Server 暫時斷開
 
-### 启动后打不开页面
+如果見到 `503, App server restarting, please wait 30s.`，先等倒數完，唔好連續撳發送。需要應急處理時，可以去「設定」開啟「調試模式」，喺「APP Server 日誌」頂部按 `Restart App Server`。重啟可能會中斷正在執行嘅任務。
 
-可以先确认服务是否正常：
+### 同官方 Desktop 同時使用時同步唔及時
+
+OpenCodex 同官方 Desktop 會各自維護頁面狀態，資料來源相同，但畫面未必每一刻都同步。Web lease 只控制瀏覽器端操作權，唔等於官方 App Server 嘅活動 turn；後台仲做緊嘢時，另一端仍然可能顯示 session 忙碌。
+
+### 啟動後打唔開頁面
+
+先檢查健康狀態：
 
 ```bash
 curl http://127.0.0.1:3737/api/health
 ```
 
-如果端口被占用，可以换一个端口：
+如果端口已經俾其他程式用咗，可以換一個：
 
 ```bash
 PORT=3738 pnpm run web:dev
 ```
 
-## 插件系统
+## 插件系統
 
-OpenCodex自带插件系统，可以通过插件对Codex做一些功能增强，欢迎广大开发者基于本系统开发插件
+OpenCodex 內置 Plugin SDK v2。PC Web 可以用插件擴充 Codex 功能，外部插件需要使用 `apiVersion: 2`、ESM 入口同兼容嘅 SDK 版本。Mobile Web 暫時未提供 UI 插件宿主，但仍然可以共用部分 Gateway 層能力。
 
-- [插件开发文档](docs/PLUGINS.md)
+- [插件開發文件](docs/PLUGINS.md)
 
-## 友链
+## 友鏈
 
 [LinuxDo](https://linux.do/)

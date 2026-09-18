@@ -1,5 +1,4 @@
 {
-  "launcher.codex.restoreBackup": "还原上一版本",
   "common.unknown": "未知",
   "common.notFound": "未找到",
   "common.notCreated": "未创建",
@@ -14,7 +13,6 @@
   "common.status": "状态",
   "launcher.status.ready": "已就绪",
   "launcher.status.gatewayStarted": "Gateway 已启动",
-  "launcher.status.healthWarning": "健康异常",
   "launcher.status.starting": "启动中",
   "launcher.status.stopped": "未运行",
   "launcher.hero.urlLabel": "访问地址",
@@ -104,7 +102,7 @@
   "web.settings.notificationTestBody": "后续官方通知将通过当前浏览器显示。",
   "web.settings.notificationUnsupported": "当前浏览器不支持",
   "web.settings.developerDiagnostics": "开发者诊断",
-  "web.settings.runtimeCompatibility": "运行时兼容性",
+  "web.settings.runtimeCompatibility": "官方运行时兼容性",
   "web.settings.runtimeCompatibilityDescription": "查看修改点的定位、应用、验证和命中状态",
   "web.settings.about": "关于",
   "web.settings.star": "如果觉得有用，欢迎 Star 支持",

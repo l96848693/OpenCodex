@@ -4,6 +4,10 @@ Codex.app/
 # Dependencies
 node_modules/
 .pnpm-store/
+dev_docs/
+AGENTS.md
+CLAUDE.md
+COMMON.md
 
 # Build outputs
 out/
@@ -15,6 +19,10 @@ release/
 cache/
 official-user-data/
 reports/
+.playwright-mcp/
+output/
+tests/
+
 
 # Upstream ASAR extracts and build-time copies (all generated)
 src/
@@ -22,11 +30,18 @@ src/
 !gateway/src/**
 !web-shell/src/
 !web-shell/src/**
+!web-mobile/src/
+!web-mobile/src/**
+!shared/mobile-client/src/
+!shared/mobile-client/src/**
+!shared/mobile-contract/src/
+!shared/mobile-contract/src/**
 # v2 插件示例源码需要随仓库发布，避免通用上游源码规则误过滤。
 !examples/plugin-v2-hello/src/
 !examples/plugin-v2-hello/src/**
 
 # Logs
+logs/
 *.log
 npm-debug.log*
 pnpm-debug.log*
@@ -40,6 +55,7 @@ Thumbs.db
 .vscode/
 *.swp
 *.swo
+.claude
 
 # Environment
 .env

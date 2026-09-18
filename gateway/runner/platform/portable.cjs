@@ -294,7 +294,19 @@ async function createPortableRunner({ layout, runtimeDir, logger, runCompatibili
     () => ensurePortableRuntimeCopy({ layout, runnerRootDir, runnerExecutablePath, markerPath, logger })
   );
   // app.asar 是 OpenCodex gateway 壳，必须每次按当前代码路径重写；官方资源目录只通过 env/process.resourcesPath 指回原安装包。
-  fs.rmSync(runnerResourcesDir, { recursive: true, force: true });
+  try {
+    fs.rmSync(runnerResourcesDir, { recursive: true, force: true });
+  } catch (error) {
+    if (error && (error.code === "EPERM" || error.code === "EBUSY" || error.code === "EACCES")) {
+      const busyError = new Error(
+        `OpenCodex Electron runtime 仲喺使用中，無法重建 ${runnerRootDir}。請先關閉現有 Gateway，再重新啟動。`
+      );
+      busyError.code = "ERR_OPENCODEX_RUNTIME_IN_USE";
+      busyError.cause = error;
+      throw busyError;
+    }
+    throw error;
+  }
   fs.mkdirSync(runnerResourcesDir, { recursive: true });
   const runnerAsarPath = await runCompatibility(
     runnerPoints.gatewayAsar,

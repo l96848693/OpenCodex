@@ -15,7 +15,6 @@ const IOS_FIX_SOURCE = fs.readFileSync(
   "utf8"
 );
 const WCO_SOURCE = fs.readFileSync(path.join(INTERNAL_PROVIDER_DIR, "codex-window-controls-overlay.js"), "utf8");
-const WCO_STYLE_SOURCE = fs.readFileSync(path.join(WEB_SHELL_DIR, "codex-window-controls-overlay.css"), "utf8");
 const COMPOSER_SOURCE = fs.readFileSync(
   path.join(INTERNAL_PROVIDER_DIR, "codex-smart-model-router-composer.js"),
   "utf8"
@@ -238,7 +237,6 @@ function createScheduler() {
 
 function installAdapterHost(window, MutationObserverClass) {
   // 单元测试用最小 Provider 门面；真实共享、去重和引用计数由 browser-host 专项测试覆盖。
-  const managedFactories = new Map();
   window.__OpenCodexAdapterHost = {
     dom: {
       observe({ root, options, callback }) {
@@ -269,18 +267,6 @@ function installAdapterHost(window, MutationObserverClass) {
           cancelAnimationFrame: (...args) => window.cancelAnimationFrame(...args),
         };
       },
-    },
-    providers: {
-      registerManaged(key, pointAlias, factory) {
-        managedFactories.set(`${key}:${pointAlias}`, factory);
-      },
-    },
-  };
-  return {
-    activateManaged(key, onHit = () => {}, pointAlias = "primary") {
-      const factory = managedFactories.get(`${key}:${pointAlias}`);
-      assert.equal(typeof factory, "function", `missing managed provider factory: ${key}:${pointAlias}`);
-      return factory({ onHit });
     },
   };
 }
@@ -662,27 +648,6 @@ test("offscreen animation guard releases and reinstalls when the sidebar root is
   assert.equal(intersectionObservers.at(-1).options.root, second.sidebar);
 });
 
-test("iOS shell keeps the composer above the Home Indicator and collapses the desktop header slot", () => {
-  // 最新官方 Renderer 使用语义 data 属性，不再提供旧版 thread-scroll/footer/find-composer 标记。
-  assert.match(IOS_FIX_SOURCE, /\[data-app-shell-main-content-layout\]/);
-  assert.match(IOS_FIX_SOURCE, /\[data-codex-composer-root\]/);
-  assert.match(IOS_FIX_SOURCE, /\[data-app-shell-main-content-layout\] \[role=['"]main['"]\]/);
-  // iPhone 底部必须同时保留 Home Indicator 安全区和基础间距，不能只取两者较大值。
-  assert.match(
-    IOS_FIX_SOURCE,
-    /--opencodex-ios-footer-padding-bottom:\s*calc\(env\(safe-area-inset-bottom, 0px\) \+ 8px\)/
-  );
-  assert.match(
-    IOS_FIX_SOURCE,
-    /\[data-codex-composer-root\][\s\S]*padding-bottom: var\(--opencodex-ios-footer-padding-bottom\) !important/
-  );
-  // 移动端 start slot 不得继续占用桌面侧栏宽度，否则左上按钮会落到侧栏中央。
-  assert.match(
-    IOS_FIX_SOURCE,
-    /header\[data-app-shell-header-edge-scroll\] > \[data-test-id="header-shell-slot"\]:first-child[\s\S]*inline-size: auto !important/
-  );
-});
-
 test("shared viewport coordinator coalesces event storms and owns one listener source", () => {
   const scheduler = createScheduler();
   const document = new ListenerTarget();
@@ -811,6 +776,46 @@ test("shared viewport coordinator coalesces event storms and owns one listener s
   disposeResumed();
 });
 
+test("mobile viewport metrics separate browser chrome from keyboard inset", () => {
+  const registeredPlugins = [];
+  const document = new ListenerTarget();
+  document.documentElement = { clientHeight: 843 };
+  document.body = { clientHeight: 843 };
+  document.visibilityState = "visible";
+  const window = new ListenerTarget();
+  Object.assign(window, {
+    OpenCodexPluginSystem: { registerPlugin(plugin) { registeredPlugins.push(plugin); } },
+    innerHeight: 843,
+    navigator: {},
+    screen: { height: 915, availHeight: 891 },
+    visualViewport: { height: 819, offsetTop: 0 },
+  });
+  window.__OpenCodexAdapterHost = { events: { observe() { return () => {}; } } };
+  window.window = window;
+  vm.runInNewContext(MOBILE_VIEWPORT_SOURCE, { console, document, window });
+  const metrics = window.__OpenCodexMobileViewportMetrics;
+  assert.ok(metrics && typeof metrics.viewportInsets === "function");
+
+  const toolbar = metrics.viewportInsets({ innerHeight: 843, visualBottom: 819, screenHeight: 915, screenAvailableHeight: 891 }, false);
+  assert.deepEqual({ ...toolbar }, { browserChromeInset: 72, keyboardInset: 24, keyboardVisible: false });
+
+  const keyboard = metrics.viewportInsets({ innerHeight: 843, visualBottom: 543, screenHeight: 915, screenAvailableHeight: 891 }, true);
+  assert.deepEqual({ ...keyboard }, { browserChromeInset: 0, keyboardInset: 300, keyboardVisible: true });
+
+  const fallback = metrics.viewportInsets({ innerHeight: 800, visualBottom: 736 }, false);
+  assert.deepEqual({ ...fallback }, { browserChromeInset: 64, keyboardInset: 64, keyboardVisible: false });
+
+  const overlayToolbar = metrics.viewportInsets({ innerHeight: 915, visualBottom: 915, screenHeight: 915, screenAvailableHeight: 915 }, false);
+  assert.deepEqual({ ...overlayToolbar }, { browserChromeInset: 64, keyboardInset: 0, keyboardVisible: false });
+
+  const focusedShortKeyboard = metrics.viewportInsets({ innerHeight: 800, visualBottom: 700 }, true);
+  assert.deepEqual({ ...focusedShortKeyboard }, { browserChromeInset: 0, keyboardInset: 100, keyboardVisible: true });
+
+  // Chromium resize 模式会同时缩短 innerHeight/visualViewport；要靠未聚焦稳定高度识别键盘。
+  const synchronizedKeyboard = metrics.viewportInsets({ innerHeight: 600, visualBottom: 600, visualHeight: 600 }, true, 800);
+  assert.deepEqual({ ...synchronizedKeyboard }, { browserChromeInset: 0, keyboardInset: 200, keyboardVisible: true });
+});
+
 test("WCO heavy observers exist only while the overlay is visible", () => {
   const scheduler = createScheduler();
   const overlay = new ListenerTarget();
@@ -885,7 +890,7 @@ test("WCO heavy observers exist only while the overlay is visible", () => {
     requestAnimationFrame: scheduler.requestAnimationFrame,
     setTimeout: scheduler.setTimeout,
   });
-  const adapterHarness = installAdapterHost(window, TestMutationObserver);
+  installAdapterHost(window, TestMutationObserver);
   window.window = window;
 
   vm.runInNewContext(WCO_SOURCE, {
@@ -898,13 +903,7 @@ test("WCO heavy observers exist only while the overlay is visible", () => {
     window,
   });
 
-  // Provider 脚本只声明托管工厂，Kernel apply 之前不得接触当前文档。
-  assert.equal(root.dataset.opencodexWcoVisible, undefined);
-  assert.equal(head.children.length, 0);
-  const contribution = adapterHarness.activateManaged("window-controls");
   assert.equal(root.dataset.opencodexWcoVisible, "false");
-  assert.equal(head.children.length, 1);
-  contribution.verify();
   assert.equal(mutationObservers.length, 0);
   assert.equal(resizeObservers.length, 0);
   scheduler.flushFrames();
@@ -964,191 +963,129 @@ test("WCO heavy observers exist only while the overlay is visible", () => {
   window.emit("resize");
   assert.equal(mutationObservers.length, 2);
   assert.equal(resizeObservers.length, 2);
-  contribution.dispose();
+  window.__opencodexWindowControlsOverlayState.cleanup();
   assert.equal(window.listenerCount("resize"), 0);
   assert.equal(document.listenerCount("visibilitychange"), 0);
-  assert.equal(root.dataset.opencodexWcoVisible, undefined);
-  assert.equal(head.children.length, 0);
 });
 
-test("WCO aligns header actions to the visible right-panel boundary", () => {
-  const scheduler = createScheduler();
-  const overlay = new ListenerTarget();
-  overlay.visible = false;
-  overlay.getTitlebarAreaRect = () => ({ height: 32, width: 1100, x: 0, y: 0 });
-  const displayMode = new ListenerTarget();
-  displayMode.matches = false;
-  const root = new TestElement("html");
-  const head = new TestElement("head");
-  const body = new TestElement("body");
-  const header = new TestElement("header");
-  const leftSlot = new TestElement("div");
-  const slot = new TestElement("div");
-  const titlebarObstacle = new TestElement("div");
-  const rightPanel = new TestElement("aside");
-  const rightPanelToolbar = new TestElement("div");
-  const rightPanelStrip = new TestElement("div");
-  leftSlot.setAttribute("data-test-id", "header-shell-slot");
-  slot.setAttribute("data-test-id", "header-shell-slot");
-  slot.style.width = "600px";
-  header.appendChild(leftSlot);
-  header.appendChild(slot);
-  header.appendChild(titlebarObstacle);
-  header.style.width = "1200px";
-  header.getBoundingClientRect = () => ({ bottom: 32, height: 32, left: 0, right: 1100, top: 0, width: 1100 });
-  header.setAttribute("data-opencodex-wco-has-right-panel-toolbar", "true");
-  rightPanelToolbar.setAttribute("data-app-shell-tab-row", "true");
-  rightPanel.appendChild(rightPanelToolbar);
-  rightPanelToolbar.appendChild(rightPanelStrip);
-  rightPanelStrip.style.width = "400px";
-  rightPanelStrip.setAttribute("data-opencodex-wco-right-panel-strip", "true");
-  rightPanel.setAttribute("data-opencodex-wco-right-panel-toolbar-clip", "true");
-  root.style.setProperty("--opencodex-wco-right-panel-toolbar-extend", "400px");
-  let rightPanelVisible = true;
-  let rightPanelStripVisible = false;
-  rightPanel.getBoundingClientRect = () => rightPanelVisible
-    ? { bottom: 800, height: 800, left: 800, right: 1200, top: 0, width: 400 }
-    : { bottom: 0, height: 0, left: 0, right: 0, top: 0, width: 0 };
-  rightPanelStrip.closest = (selector) => {
-    if (selector === '[data-app-shell-focus-area="right-panel"]') return rightPanel;
-    if (selector === "[data-app-shell-tab-row]") return rightPanelToolbar;
-    return null;
-  };
-  rightPanelStrip.getBoundingClientRect = () => rightPanelStripVisible
-    ? { bottom: 32, height: 32, left: 800, right: 1200, top: 0, width: 400 }
-    : { bottom: 0, height: 0, left: 0, right: 0, top: 0, width: 0 };
-  const document = new ListenerTarget();
-  Object.assign(document, {
-    body,
-    documentElement: root,
-    head,
-    visibilityState: "visible",
-    createElement: (tagName) => new TestElement(tagName),
-    elementFromPoint: () => null,
-    getElementById: () => null,
-    querySelector: (selector) => {
-      if (selector === "header[data-app-shell-header-edge-scroll]") return header;
-      if (selector.includes('header[data-app-shell-header-edge-scroll] > [data-test-id="header-shell-slot"]')) {
-        return slot;
-      }
-      return null;
-    },
-    querySelectorAll: (selector) => {
-      if (selector === "header[data-app-shell-header-edge-scroll]") return [header];
-      if (selector === '[data-opencodex-wco-right-slot="true"]') {
-        return slot.getAttribute("data-opencodex-wco-right-slot") === "true" ? [slot] : [];
-      }
-      if (selector === '[data-opencodex-wco-align-right-panel="true"]') {
-        return slot.getAttribute("data-opencodex-wco-align-right-panel") === "true" ? [slot] : [];
-      }
-      if (selector === 'aside[data-app-shell-focus-area="right-panel"]') return [rightPanel];
-      if (selector === '[data-app-shell-tab-strip-controller="right"]') return [rightPanelStrip];
-      if (selector === '[data-opencodex-wco-right-panel-toolbar="true"]') {
-        return rightPanelToolbar.getAttribute("data-opencodex-wco-right-panel-toolbar") === "true"
-          ? [rightPanelToolbar]
-          : [];
-      }
-      if (selector === '[data-opencodex-wco-right-panel-strip="true"]') {
-        return rightPanelStrip.getAttribute("data-opencodex-wco-right-panel-strip") === "true"
-          ? [rightPanelStrip]
-          : [];
-      }
-      if (selector === '[data-opencodex-wco-right-panel-toolbar-clip="true"]') {
-        return rightPanel.getAttribute("data-opencodex-wco-right-panel-toolbar-clip") === "true"
-          ? [rightPanel]
-          : [];
-      }
-      if (selector === "header[data-opencodex-wco-has-right-panel-toolbar]") {
-        return header.getAttribute("data-opencodex-wco-has-right-panel-toolbar") == null ? [] : [header];
-      }
-      return [];
-    },
-  });
-  const window = new ListenerTarget();
-  Object.assign(window, {
-    cancelAnimationFrame: scheduler.cancelAnimationFrame,
-    clearTimeout: scheduler.clearTimeout,
-    getComputedStyle: () => ({
-      backgroundColor: "transparent",
-      columnGap: "0",
-      gap: "0",
-      getPropertyValue: () => "",
-    }),
-    innerHeight: 800,
-    innerWidth: 1200,
-    matchMedia: (query) => query === "(display-mode: window-controls-overlay)"
-      ? displayMode
-      : { matches: false },
-    requestAnimationFrame: scheduler.requestAnimationFrame,
-    setTimeout: scheduler.setTimeout,
-  });
-  class TestMutationObserver {
-    constructor() {}
-    disconnect() {}
-    observe() {}
-  }
-  class TestResizeObserver extends TestMutationObserver {}
-  const adapterHarness = installAdapterHost(window, TestMutationObserver);
-  window.window = window;
+test("WCO installs the finite elementFromPoint guard before bridge code", () => {
+  assert.match(WCO_SOURCE, /installFiniteElementFromPointGuard\(\);/);
+  assert.match(WCO_SOURCE, /__codexFiniteElementFromPoint/);
+  assert.ok(WCO_SOURCE.indexOf("installFiniteElementFromPointGuard();") < WCO_SOURCE.indexOf("const activeRoot"));
+});
 
+test("WCO rewrites app-fs resource attributes before Chromium starts loading them", () => {
+  assert.match(WCO_SOURCE, /function installEarlyAppFsResourceGuard/);
+  assert.match(WCO_SOURCE, /function guardedSetAttribute\(name, value\)/);
+  assert.match(WCO_SOURCE, /guardResourceProperty\(w\.HTMLImageElement\?\.prototype, "src"\)/);
+  assert.match(WCO_SOURCE, /__opencodexAppFsUrlToGatewayUrl/);
+  assert.ok(WCO_SOURCE.indexOf("installEarlyAppFsResourceGuard();") < WCO_SOURCE.indexOf("const activeRoot"));
+
+  class TestElement {
+    constructor(tagName) {
+      this.tagName = tagName;
+      this.attributes = new Map();
+    }
+
+    setAttribute(name, value) {
+      this.attributes.set(name, String(value));
+    }
+
+    getAttribute(name) {
+      return this.attributes.get(name) || null;
+    }
+  }
+  class TestImageElement extends TestElement {
+    constructor() {
+      super("IMG");
+      this.source = "";
+    }
+
+    get src() {
+      return this.source;
+    }
+
+    set src(value) {
+      this.source = String(value);
+    }
+  }
+  class TestSourceElement extends TestImageElement {}
+  class TestLinkElement extends TestElement {
+    constructor() {
+      super("LINK");
+      this.target = "";
+    }
+
+    get href() {
+      return this.target;
+    }
+
+    set href(value) {
+      this.target = String(value);
+    }
+  }
+  class TestDocument {
+    elementFromPoint() {
+      return null;
+    }
+  }
+
+  const document = new TestDocument();
+  document.documentElement = {};
+  const window = {
+    Document: TestDocument,
+    Element: TestElement,
+    HTMLImageElement: TestImageElement,
+    HTMLLinkElement: TestLinkElement,
+    HTMLSourceElement: TestSourceElement,
+    __OpenCodexAdapterHost: { dom: { observe() {} }, events: { observe() {} } },
+  };
+  window.window = window;
+  window.__opencodexWindowControlsOverlayState = { document, root: document.documentElement };
+  vm.runInNewContext(WCO_SOURCE, { URL, document, location: { origin: "http://127.0.0.1:3737" }, window });
+
+  const attributeImage = new TestImageElement();
+  attributeImage.setAttribute("src", "app://fs/@fs/C:/Users/young/icon%20one.png");
+  assert.equal(attributeImage.getAttribute("src"), "http://127.0.0.1:3737/api/app-fs/@fs/C%3A/Users/young/icon%20one.png");
+  const propertyImage = new TestImageElement();
+  propertyImage.src = "app://fs/@fs/C:/Users/young/icon%20two.png";
+  assert.equal(propertyImage.src, "http://127.0.0.1:3737/api/app-fs/@fs/C%3A/Users/young/icon%20two.png");
+});
+
+test("WCO captures Statsig telemetry before the official bundle keeps fetch", async () => {
+  const forwarded = [];
+  const document = { documentElement: {} };
+  const window = {
+    fetch: async (input) => {
+      forwarded.push(String(input));
+      return new Response("upstream", { status: 202 });
+    },
+    __OpenCodexAdapterHost: { dom: { observe() {} }, events: { observe() {} } },
+  };
+  window.window = window;
+  window.__opencodexWindowControlsOverlayState = { document, root: document.documentElement };
   vm.runInNewContext(WCO_SOURCE, {
-    HTMLElement: TestElement,
-    MutationObserver: TestMutationObserver,
-    ResizeObserver: TestResizeObserver,
-    console,
+    URL,
+    Response,
     document,
-    navigator: { windowControlsOverlay: overlay },
+    location: { href: "http://127.0.0.1:3737/", origin: "http://127.0.0.1:3737" },
     window,
   });
 
-  const contribution = adapterHarness.activateManaged("window-controls");
-  overlay.visible = true;
-  overlay.emit("geometrychange");
-  scheduler.flushFrames();
+  // 模擬官方 SDK 喺後續 bridge 載入前保存目前 fetch；保存後仍要命中本地成功響應。
+  const capturedFetch = window.fetch;
+  const telemetry = await capturedFetch("https://chatgpt.com/ces/v1/rgstr?k=client");
+  assert.equal(telemetry.status, 200);
+  assert.deepEqual(JSON.parse(await telemetry.text()), {});
+  const ordinary = await capturedFetch("https://example.com/data");
+  assert.equal(ordinary.status, 202);
+  assert.deepEqual(forwarded, ["https://example.com/data"]);
+});
 
-  assert.equal(slot.getAttribute("data-opencodex-wco-right-slot"), "true");
-  assert.equal(leftSlot.getAttribute("data-opencodex-wco-right-slot"), null);
-  assert.equal(titlebarObstacle.getAttribute("data-opencodex-wco-right-slot"), null);
-  // 右侧栏宽 400px，其中 100px 被 Chrome 控件排除，header slot 应只占剩余 300px。
-  assert.equal(slot.getAttribute("data-opencodex-wco-align-right-panel"), "true");
-  assert.equal(root.style.getPropertyValue("--opencodex-wco-right-slot-width"), "300px");
-  // 不可见的缓存 strip 不能触发布局，旧版跨分栏位移状态也必须被清除。
-  assert.equal(header.getAttribute("data-opencodex-wco-has-right-panel-toolbar"), null);
-  assert.equal(rightPanelToolbar.getAttribute("data-opencodex-wco-right-panel-toolbar"), null);
-  assert.equal(rightPanelStrip.getAttribute("data-opencodex-wco-right-panel-strip"), null);
-  assert.equal(rightPanel.getAttribute("data-opencodex-wco-right-panel-toolbar-clip"), null);
-  assert.equal(root.style.getPropertyValue("--opencodex-wco-right-panel-toolbar-extend"), "");
-  assert.match(
-    WCO_STYLE_SOURCE,
-    /\[data-opencodex-wco-right-slot="true"\]\[data-opencodex-wco-align-right-panel="true"\][\s\S]*width: var\(--opencodex-wco-right-slot-width\) !important;/
-  );
-  assert.doesNotMatch(WCO_STYLE_SOURCE, /app-shell-header-context-menu-surface/);
-  assert.doesNotMatch(WCO_STYLE_SOURCE, /data-opencodex-wco-has-right-panel-toolbar/);
-  assert.doesNotMatch(WCO_STYLE_SOURCE, /opencodex-wco-right-panel-toolbar-extend/);
-
-  // 真正显示在右侧面板里的 tab row 只获得右侧系统按钮避让，不改变所在分栏。
-  rightPanelStripVisible = true;
-  overlay.emit("geometrychange");
-  scheduler.flushFrames();
-  assert.equal(rightPanelToolbar.getAttribute("data-opencodex-wco-right-panel-toolbar"), "true");
-
-  rightPanelStripVisible = false;
-  overlay.emit("geometrychange");
-  scheduler.flushFrames();
-  assert.equal(rightPanelToolbar.getAttribute("data-opencodex-wco-right-panel-toolbar"), null);
-
-  rightPanelVisible = false;
-  overlay.emit("geometrychange");
-  scheduler.flushFrames();
-  assert.equal(slot.getAttribute("data-opencodex-wco-align-right-panel"), null);
-  assert.equal(root.style.getPropertyValue("--opencodex-wco-right-slot-width"), "0px");
-  // 下一轮同步仍应命中同一个 slot，不能退回到真正的最后子节点。
-  scheduler.flushFrames();
-  assert.equal(slot.getAttribute("data-opencodex-wco-right-slot"), "true");
-  contribution.dispose();
-  assert.equal(slot.getAttribute("data-opencodex-wco-right-slot"), null);
-  assert.equal(root.style.getPropertyValue("--opencodex-wco-right-slot-width"), "");
-  assert.equal(root.style.getPropertyValue("--opencodex-wco-right-panel-toolbar-extend"), "400px");
+test("bridge expires a page immediately when the gateway instance changes", () => {
+  assert.match(BRIDGE_SOURCE, /gatewayInstanceId: cfg\.gatewayInstanceId/);
+  assert.match(BRIDGE_SOURCE, /msg\.type === "gateway-session-expired"/);
+  assert.match(BRIDGE_SOURCE, /reason: "gateway_instance_changed"/);
 });
 
 test("composer observer ignores streaming content and hidden-page mutations", () => {
@@ -1455,96 +1392,6 @@ test("tooltip guard uses one pointer stream and does no timer work without toolt
   assert.equal(scheduler.timers.size, 1);
 });
 
-test("tooltip guard preserves internal scrolling and scrollbar pointer movement but dismisses outside scrolling", () => {
-  const scheduler = createScheduler();
-  const document = new ListenerTarget();
-  const scroller = { nodeType: 1 };
-  const outside = { nodeType: 1 };
-  const tooltip = {
-    nodeType: 1,
-    id: "changed-files-tooltip",
-    contains: (node) => node === scroller,
-  };
-  document.querySelector = () => tooltip;
-  document.querySelectorAll = () => [tooltip];
-  document.activeElement = null;
-  document.elementFromPoint = () => scroller;
-  const window = new ListenerTarget();
-  let dismissCount = 0;
-  Object.assign(window, {
-    Event: class TestEvent {
-      constructor(type) { this.type = type; }
-    },
-    PointerEvent: class TestPointerEvent {},
-    dispatchEvent(event) {
-      assert.equal(event.type, "codex:dismiss-tooltips");
-      dismissCount += 1;
-    },
-    clearTimeout: scheduler.clearTimeout,
-    setTimeout: scheduler.setTimeout,
-  });
-  installAdapterHost(window, class {});
-  vm.runInNewContext(TOOLTIP_SOURCE, { console, document, window });
-
-  // 滚轮和原生滚动条最终都在滚动容器上派发 scroll，根节点与嵌套容器都要保留。
-  document.emit("scroll", { target: tooltip });
-  document.emit("scroll", { target: scroller });
-  document.emit("pointermove", { target: scroller, clientX: 100, clientY: 80 });
-  scheduler.flushTimers();
-  assert.equal(dismissCount, 0);
-
-  // 即使指针仍停在弹窗内，背景滚动也应继续关闭，不能只判断指针位置。
-  document.emit("scroll", { target: outside });
-  assert.equal(dismissCount, 1);
-  document.emit("scroll");
-  assert.equal(dismissCount, 2);
-  window.emit("blur");
-  assert.equal(dismissCount, 3);
-});
-
-test("gateway logout is inserted after settings with or without official logout", () => {
-  // 覆盖 API 登录没有官方退出项，以及账号登录保留官方退出项的菜单。
-  for (const label of ["设置", "Settings", "Settings ⌘,"]) {
-    for (const hasLogout of [false, true]) {
-      const menu = {
-        children: [],
-        getAttribute: (name) => name === "role" ? "menu" : null,
-        insertBefore(item, next) {
-          const index = next ? this.children.indexOf(next) : this.children.length;
-          this.children.splice(index, 0, item);
-        },
-      };
-      const settings = {
-        nodeType: 1, tagName: "BUTTON", dataset: {}, innerText: label,
-        parentElement: menu, getAttribute: () => null,
-        getBoundingClientRect: () => ({ width: 100, height: 30 }),
-      };
-      const logout = { ...settings, innerText: "Log out" };
-      settings.nextSibling = hasLogout ? logout : null;
-      menu.children = hasLogout ? [settings, logout] : [settings];
-      const document = { body: {}, querySelectorAll: () => menu.children };
-      const api = vm.runInNewContext(`(() => {
-        const w = {};
-        const GATEWAY_AUTH_LOGOUT_LABEL = "退出认证";
-        ${sourceSection(BRIDGE_SOURCE, "  const OFFICIAL_SETTINGS_LABELS", "  const MESSAGE_FOR_VIEW_CHANNEL")}
-        ${sourceSection(BRIDGE_SOURCE, "  function visibleElement", "  function removeDuplicatedIdentityAttributes")}
-        function createGatewayAuthLogoutMenuItem() {
-          return { nodeType: 1, dataset: { codexWebGatewayAuthLogout: "true" } };
-        }
-        ${sourceSection(BRIDGE_SOURCE, "  function injectGatewayAuthLogoutMenuItem", "  function installGatewayAuthMenuInjection")}
-        return { scanGatewayAuthLogoutMenuItems, isOfficialSettingsMenuItem };
-      })()`, { document });
-      assert.equal(api.scanGatewayAuthLogoutMenuItems(), 1);
-      assert.equal(menu.children[0], settings);
-      assert.equal(menu.children[1].dataset.codexWebGatewayAuthLogout, "true");
-      if (hasLogout) assert.equal(menu.children[2], logout);
-      assert.equal(api.scanGatewayAuthLogoutMenuItems(), 0);
-      assert.equal(api.isOfficialSettingsMenuItem({ ...settings, innerText: "Project settings" }), false);
-      assert.equal(api.isOfficialSettingsMenuItem({ ...settings, parentElement: document.body }), false);
-    }
-  }
-});
-
 test("gateway logout menu observes DOM only during an interaction session", () => {
   const scheduler = createScheduler();
   const document = new ListenerTarget();
@@ -1719,18 +1566,13 @@ test("remote file menu observes DOM only during a file-tree context-menu session
 test("shared and persisted snapshots are bounded while preserving active keys", () => {
   const snapshots = vm.runInNewContext(
     `(() => {
-      const SHARED_OBJECT_SNAPSHOT_MAX_ENTRIES = 5;
+      const SHARED_OBJECT_SNAPSHOT_MAX_ENTRIES = 4;
       const PERSISTED_ATOM_SNAPSHOT_MAX_ENTRIES = 4;
       const STATSIG_DEFAULT_FEATURES_CONFIG = "statsig";
-      const PENDING_WORKTREES_KEY = "pending_worktrees";
       const COMPOSER_PERMISSION_MODE_VISIBILITY_KEY = "composer-mode";
       const sharedObjectSnapshot = new Map();
       const persistedAtomSnapshot = new Map();
-      const PINNED_SHARED_OBJECT_SNAPSHOT_KEYS = new Set([
-        "host_config",
-        STATSIG_DEFAULT_FEATURES_CONFIG,
-        PENDING_WORKTREES_KEY,
-      ]);
+      const PINNED_SHARED_OBJECT_SNAPSHOT_KEYS = new Set(["host_config", STATSIG_DEFAULT_FEATURES_CONFIG]);
       const PINNED_PERSISTED_ATOM_SNAPSHOT_KEYS = new Set([
         "prompt-history",
         COMPOSER_PERMISSION_MODE_VISIBILITY_KEY,
@@ -1749,13 +1591,10 @@ test("shared and persisted snapshots are bounded while preserving active keys", 
     })()`
   );
 
-  for (const key of ["host_config", "statsig", "pending_worktrees", "shared-a", "shared-b"]) snapshots.setShared(key);
+  for (const key of ["host_config", "statsig", "shared-a", "shared-b"]) snapshots.setShared(key);
   snapshots.setShared("shared-a");
   snapshots.setShared("shared-c");
-  assert.deepEqual(
-    Array.from(snapshots.sharedKeys()),
-    ["host_config", "statsig", "pending_worktrees", "shared-a", "shared-c"]
-  );
+  assert.deepEqual(Array.from(snapshots.sharedKeys()), ["host_config", "statsig", "shared-a", "shared-c"]);
 
   for (const key of ["prompt-history", "composer-mode", "atom-a", "atom-b"]) snapshots.setPersisted(key);
   snapshots.setPersisted("atom-a");
@@ -1769,7 +1608,6 @@ test("official shared-object updates remain authoritative for guardian approval"
       const SHARED_OBJECT_SNAPSHOT_MAX_ENTRIES = 8;
       const STATSIG_DEFAULT_FEATURES_CONFIG = "statsig_default_enable_features";
       const STATSIG_DEFAULT_FEATURE_OVERRIDES = { "505458": true };
-      const PENDING_WORKTREES_KEY = "pending_worktrees";
       const sharedObjectSnapshot = new Map();
       const PINNED_SHARED_OBJECT_SNAPSHOT_KEYS = new Set([STATSIG_DEFAULT_FEATURES_CONFIG]);
       function trimSnapshotMap() {}
@@ -1812,40 +1650,6 @@ test("official shared-object updates remain authoritative for guardian approval"
   assert.doesNotMatch(subscribeSection, /emitSharedObjectSnapshotValue/);
   assert.doesNotMatch(BRIDGE_SOURCE, /guardian_approval:\s*true/);
   assert.match(BRIDGE_SOURCE, /effectiveChannel === "shared-object-updated"[\s\S]*cacheSharedObjectUpdatedPayload/);
-});
-
-test("pending worktree shared-object state follows the official array-or-undefined contract", () => {
-  const state = vm.runInNewContext(
-    `(() => {
-      const SHARED_OBJECT_SNAPSHOT_MAX_ENTRIES = 8;
-      const STATSIG_DEFAULT_FEATURES_CONFIG = "statsig_default_enable_features";
-      const STATSIG_DEFAULT_FEATURE_OVERRIDES = {};
-      const PENDING_WORKTREES_KEY = "pending_worktrees";
-      const sharedObjectSnapshot = new Map();
-      const PINNED_SHARED_OBJECT_SNAPSHOT_KEYS = new Set([PENDING_WORKTREES_KEY]);
-      function trimSnapshotMap() {}
-      ${sourceSection(BRIDGE_SOURCE, "  function isPlainObject", "\n\n  /** shared-object snapshot")}
-      ${sourceSection(BRIDGE_SOURCE, "  function normalizeSharedObjectSnapshotValue", "\n\n  /** 更新本地 shared-object")}
-      ${sourceSection(BRIDGE_SOURCE, "  function setSharedObjectSnapshotValue", "\n\n  /** 读取 shared-object")}
-      ${sourceSection(BRIDGE_SOURCE, "  function getSharedObjectSnapshotValue", "\n\n  /** 异步发出 shared-object")}
-      return {
-        cache: cacheSharedObjectUpdatedPayload,
-        keys: () => Array.from(sharedObjectSnapshot.keys()),
-        read: (key) => getSharedObjectSnapshotValue(key),
-      };
-    })()`
-  );
-
-  // 官方 preload 对缺失键返回 undefined；收到真实数组后仍保持其引用和值不变。
-  assert.equal(state.read("pending_worktrees"), undefined);
-  assert.deepEqual(Array.from(state.keys()), []);
-  const pending = [{ id: "worktree-1", clientThreadId: "client-thread-1" }];
-  assert.equal(state.cache({ key: "pending_worktrees", value: pending }).value, pending);
-  assert.deepEqual(JSON.parse(JSON.stringify(state.read("pending_worktrees"))), pending);
-  assert.equal(state.cache({ key: "pending_worktrees", value: null }).value, undefined);
-  assert.equal(state.read("pending_worktrees"), undefined);
-  assert.deepEqual(Array.from(state.keys()), []);
-  assert.equal(state.read("unknown-key"), null);
 });
 
 test("connector logo response cache is bounded and refreshes LRU order", () => {
@@ -2380,6 +2184,7 @@ test("whole-document observer filters stay scoped to their feature mounts", () =
   assert.match(BRIDGE_SOURCE, /if \(handleStatsigTelemetryFetchMessage\(payload\)\)/);
   assert.match(BRIDGE_SOURCE, /target\.getDesktopUserAgent = \(\) => navigator\.userAgent/);
   assert.match(BRIDGE_SOURCE, /w\.__opencodexPluginImageUrl = localPluginImageUrl/);
+  assert.match(BRIDGE_SOURCE, /route-empty-warning-suppressed/);
   assert.match(BRIDGE_SOURCE, /return `\/api\/plugin-image\?path=\$\{encodeURIComponent\(filePath\)\}`/);
   assert.match(BRIDGE_SOURCE, /activeBrowserFilePickerCancel\?\.\(\)/);
   assert.match(BRIDGE_SOURCE, /sessionTimeout = scheduler\.setTimeout\(cancelPicker, FILE_PICKER_SESSION_TIMEOUT_MS\)/);
@@ -2416,9 +2221,19 @@ test("whole-document observer filters stay scoped to their feature mounts", () =
   assert.match(REMOTE_FILE_ACTIONS_SOURCE, /function observePendingPathMenu\(session\)/);
   assert.doesNotMatch(REMOTE_FILE_ACTIONS_SOURCE, /new MutationObserver/);
   assert.doesNotMatch(TOOLTIP_SOURCE, /new (?:w\.)?MutationObserver/);
-  assert.match(MOBILE_VIEWPORT_SOURCE, /!context\.platform\.isMobile\(\)/);
+  assert.match(MOBILE_VIEWPORT_SOURCE, /context\.platform\.isMobile\(\)/);
+  assert.doesNotMatch(MOBILE_VIEWPORT_SOURCE, /!context\.platform\.isMobile\(\)\s*&&\s*!narrowViewport\(\)/);
+  assert.match(MOBILE_VIEWPORT_SOURCE, /narrowViewport\(\)/);
+  assert.match(MOBILE_VIEWPORT_SOURCE, /button\[aria-label='Hide sidebar'\]/);
+  assert.match(MOBILE_VIEWPORT_SOURCE, /button\[aria-label='Toggle side panel'\]/);
+  assert.doesNotMatch(MOBILE_VIEWPORT_SOURCE, /force hiding right panel|force hiding left panel/);
+  assert.doesNotMatch(MOBILE_VIEWPORT_SOURCE, /setAttribute\(['"]aria-hidden['"], ['"]true/);
   assert.match(MOBILE_VIEWPORT_SOURCE, /request\("orientationchange"/);
   assert.doesNotMatch(MOBILE_VIEWPORT_SOURCE, /will-change:\s*transform/);
+  assert.match(MOBILE_VIEWPORT_SOURCE, /data-opencodex-android-keyboard-visible/);
+  assert.match(MOBILE_VIEWPORT_SOURCE, /data-opencodex-mobile-right-panel-overlay/);
+  assert.match(MOBILE_VIEWPORT_SOURCE, /data-app-shell-main-content-layout/);
+  assert.match(MOBILE_VIEWPORT_SOURCE, /data-app-shell-workspace-layout/);
   assert.match(WCO_SOURCE, /record\.target === cssLengthProbe \|\| record\.target === cssColorProbe/);
   assert.match(WCO_SOURCE, /mutationTouchesMetrics\(record\)/);
   assert.match(TOKEN_USAGE_INLINE_SOURCE, /document\.visibilityState === "hidden"/);

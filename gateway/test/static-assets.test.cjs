@@ -212,7 +212,7 @@ function createAppHostBridgeBehaviorHarness(bridge, { wsReady = true } = {}) {
         },
       };
       function clientDiagnostic(name, payload) { diagnostics.push({ name, payload }); }
-      function publishAppHostData(data, direction) { publishedData.push({ data, direction }); return data; }
+      function publishAppHostData(data, direction) { publishedData.push({ data, direction }); }
       function payloadShape(value) { return value === null ? "null" : typeof value; }
       function websocketStateName() { return "open"; }
       ${declarations}
@@ -362,48 +362,15 @@ test("English diagnostics metadata covers every built-in group, adapter, and poi
 
 test("compatibility capabilities preserve renderer HTML output byte for byte", (t) => {
   const webviewDir = makeOfficialWebviewDir(t);
-  const baselineService = createService(webviewDir);
-  const baseline = baselineService.createRendererResponse();
+  const baseline = createService(webviewDir).createRendererResponse();
   const compatibilityService = createCompatibilityService();
   const migrated = createService(webviewDir, compatibilityService).createRendererResponse();
   assert.equal(migrated, baseline);
-  // WCO 样式由 RuntimeView Contribution 挂载，HTML 只负责按顺序加载 Provider 声明和 Kernel 激活脚本。
-  assert.doesNotMatch(baseline, /<link id="codex-web-window-controls-overlay-styles"/);
-  const bootstrap = runtimeBootstrapSource(baselineService);
-  assert.match(bootstrap, /providers\.register\("window-controls"/);
-  assert.match(bootstrap, /providers\.registerManaged\("window-controls", "primary"/);
   assert.equal(
     compatibilityService.registry.point("static.cache.renderer.html.runtime-bootstrap").status,
     "healthy"
   );
   compatibilityService.dispose();
-});
-
-test("renderer defers injected runtime only when official scripts preserve its execution order", (t) => {
-  const cases = [
-    ["module", '<script data-official-case="module" type="module" src="./assets/module.js"></script>', true],
-    ["deferred-classic", '<script data-official-case="deferred-classic" defer src="./assets/legacy.js"></script>', true],
-    ["data", '<script data-official-case="data" type="application/json">{}</script>', true],
-    ["inline-classic", '<script data-official-case="inline-classic">window.legacyStarted=true</script>', false],
-    ["classic", '<script data-official-case="classic" src="./assets/legacy.js"></script>', false],
-    ["async-module", '<script data-official-case="async-module" type="module" async src="./assets/module.js"></script>', false],
-  ];
-
-  for (const [name, officialScript, deferred] of cases) {
-    const webviewDir = makeOfficialWebviewDir(t);
-    fs.writeFileSync(
-      path.join(webviewDir, "index.html"),
-      `<html><head>${officialScript}</head><body><div id="root"></div></body></html>`
-    );
-    const html = createService(webviewDir).createRendererResponse();
-    const deferAttribute = deferred ? " defer" : "";
-    const configScript = `<script${deferAttribute} src="/codex-web-config.js"></script>`;
-    const bootstrapScript = `<script${deferAttribute} src="${OPENCODEX_RUNTIME_BOOTSTRAP_PATH}"></script>`;
-
-    assert.equal(html.includes(configScript), true, name);
-    assert.equal(html.includes(bootstrapScript), true, name);
-    assert.ok(html.indexOf(configScript) < html.indexOf(`data-official-case="${name}"`), name);
-  }
 });
 
 test("runtime bootstrap honors an explicit gzip rejection", (t) => {
@@ -437,7 +404,6 @@ test("web shell manifest requests credentials for protected origins", () => {
   const html = fs.readFileSync(WEB_SHELL_INDEX, "utf-8");
 
   assert.match(html, /<link rel="manifest" href="\/manifest\.webmanifest" crossorigin="use-credentials" \/>/);
-  assert.doesNotMatch(html, /<link id="codex-web-window-controls-overlay-styles"/);
 });
 
 test("web shell scripts revalidate unchanged content instead of retransferring it", (t) => {
@@ -530,6 +496,69 @@ test("patched official renderer hides the app-host application menu capability",
   assert.match(source, /services\.applicationMenu\.getSnapshot\(\)/);
   assert.match(source, /capabilitySnapshot=services\.applicationMenu!=null/);
   assert.doesNotMatch(source, /isWindows\(\)&&services\.applicationMenu!=null/);
+});
+
+test("patched official renderer guards RegExp v feature probe for old Samsung Chromium", (t) => {
+  const webviewDir = makeOfficialWebviewDir(t);
+  const assetsDir = path.join(webviewDir, "assets");
+  fs.mkdirSync(assetsDir, { recursive: true });
+  const assetName = "app-initial-regexp-v-test.js";
+  const sourceFixture = "var bf={unicodeSets:true};bf.bugNestedClassIgnoresNegation=bf.unicodeSets&&RegExp(`[[^a]]`,`v`).test(`a`);";
+  fs.writeFileSync(path.join(assetsDir, assetName), sourceFixture);
+  const service = createService(webviewDir);
+  const source = serveOfficialAsset(service, `${PATCHED_OFFICIAL_PREFIX}assets/${assetName}`, "localhost:3737");
+  assert.match(source, /try\{return RegExp\(`\[\[\^a\]\]`,`v`\)\.test\(`a`\)\}catch\{return false\}/);
+  assert.doesNotThrow(() => vm.runInNewContext(source, {}));
+});
+
+test("patched official renderer masks project order on the new AppHost query path", async (t) => {
+  const webviewDir = makeOfficialWebviewDir(t);
+  const assetsDir = path.join(webviewDir, "assets");
+  fs.mkdirSync(assetsDir, { recursive: true });
+  const assetName = "app-initial-project-order-test.js";
+  fs.writeFileSync(
+    path.join(assetsDir, assetName),
+    [
+      "const fkn=()=>({});",
+      "const lD={getInstance(){return{post:async(_url,body)=>({body:{value:JSON.parse(body).key===`project-order`?[`saved-project`]:`other`}})}}};",
+      "async function ukn(e,t,n,r,i){let a=(await lD.getInstance().post(`vscode://codex/${e}`,JSON.stringify(t),fkn(i),r)).body;return n?n(a):a}",
+      "function Mvi(e,_t){return [...e]}",
+      "function Iki({groups:e,projectOrder:t}){return Mvi(e,t)}",
+      "globalThis.queryGlobalState=ukn;",
+      "globalThis.sortProjectGroups=Iki;",
+    ].join("")
+  );
+  const service = createService(webviewDir);
+  const source = serveOfficialAsset(service, `${PATCHED_OFFICIAL_PREFIX}assets/${assetName}`, "localhost:3737");
+  const context = { __OpenCodexProjectRecentSortActive: true };
+  context.globalThis = context;
+  vm.runInNewContext(source, context);
+
+  // 新版只虚拟 project-order；关闭插件或读取其它 key 时必须保留官方 AppHost 返回值。
+  assert.deepEqual(JSON.parse(JSON.stringify(await context.queryGlobalState("get-global-state", { key: "project-order" }))), {
+    value: [],
+  });
+  assert.deepEqual(JSON.parse(JSON.stringify(await context.queryGlobalState("get-global-state", { key: "other" }))), {
+    value: "other",
+  });
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(context.sortProjectGroups({
+      groups: [{ projectId: "older" }, { projectId: "newer" }],
+      projectOrder: [],
+    }))).map((group) => group.projectId),
+    ["newer", "older"]
+  );
+  context.__OpenCodexProjectRecentSortActive = false;
+  assert.deepEqual(JSON.parse(JSON.stringify(await context.queryGlobalState("get-global-state", { key: "project-order" }))), {
+    value: ["saved-project"],
+  });
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(context.sortProjectGroups({
+      groups: [{ projectId: "older" }, { projectId: "newer" }],
+      projectOrder: ["older", "newer"],
+    }))).map((group) => group.projectId),
+    ["older", "newer"]
+  );
 });
 
 test("large official renderer patches complete off the gateway event loop", async (t) => {
@@ -640,10 +669,10 @@ test("patched request scheduler supports the current expanded official backgroun
     [
       "const backgroundMethods=new Set([`app/installed`,`app/list`,`app/read`,`collaborationMode/list`,`config/read`,`configRequirements/read`,`experimentalFeature/list`,`hooks/list`,`mcpServerStatus/list`,`model/list`,`permissionProfile/list`,`plugin/list`,`skills/list`]);",
       "class RequestClient{",
-      "dispatchMessage=()=>{};pendingConfigReadRequests=new Map;queuedRequests=[];",
+      "dispatchMessage=()=>{};requestPromises=new Map;inFlightRequests=new Set;pendingConfigReadRequests=new Map;queuedRequests=[];inFlightRequestCount=0;",
       "sendConfigReadRequest(params,options){return this.enqueueRequest(`config/read`,params,options)}",
       "enqueueRequest(method,params,options){return Promise.resolve({method,params,options})}",
-      "async sendRequest(e,t,n){if(this.dispatchMessage==null)throw Error(`AppServerRequestClient is missing a message dispatcher`);return e===`config/read`?this.sendConfigReadRequest(t,n):this.enqueueRequest(e,t,n)}",
+      "async sendRequest(e,t,n){if(this.dispatchMessage==null)throw Error(`AppServerRequestClient is missing a message dispatcher`);return e===`config/read`?this.sendConfigReadRequest(t,n):this.enqueueRequest(e,t,e===`plugin/list`&&n?.timeoutMs==null?{...n,timeoutMs:TCn}:n)}",
       "}",
     ].join("")
   );
@@ -717,6 +746,25 @@ test("remote renderer defers plugin summary image bytes until an image mounts", 
     ]
   );
   assert.equal(inlineReadCount, 0);
+});
+
+test("remote renderer patches the current recursive plugin image loader before app://fs is requested", (t) => {
+  const webviewDir = makeOfficialWebviewDir(t);
+  const assetsDir = path.join(webviewDir, "assets");
+  fs.mkdirSync(assetsDir, { recursive: true });
+  const assetName = "plugin-summary-image-recursive-test.js";
+  fs.writeFileSync(
+    path.join(assetsDir, assetName),
+    "const protocol=`read-file-binary`;async function load(o,e,n,r){return Promise.all([ORr(o.composerIconPath,e,n,r),ORr(o.logoPath,e,n,r),ORr(o.logoDarkPath,e,n,r)])}"
+  );
+  const patched = serveOfficialAsset(
+    createService(webviewDir),
+    `${PATCHED_OFFICIAL_PREFIX}assets/${assetName}`,
+    "192.168.1.25:3737"
+  );
+  assert.match(patched, /window\.__opencodexPluginImageUrl\?\.\(o\.composerIconPath,e\)\?\?ORr/);
+  assert.match(patched, /window\.__opencodexPluginImageUrl\?\.\(o\.logoPath,e\)\?\?ORr/);
+  assert.match(patched, /window\.__opencodexPluginImageUrl\?\.\(o\.logoDarkPath,e\)\?\?ORr/);
 });
 
 test("bridge reconnects active app-host ports after websocket hello", () => {
@@ -1589,8 +1637,8 @@ test("external plugins require an SDK-compatible ESM v2 entry and never execute 
     assert.match(aggregateSource, /modern-plugin\/entry\.mjs/);
     assert.doesNotMatch(aggregateSource, /must not execute/);
     const html = service.createRendererResponse();
-    const codecIndex = html.indexOf('<script defer src="/codex-app-host-message-codec.js"></script>');
-    const bridgeIndex = html.indexOf('<script defer src="/codex-bridge-polyfill.js"></script>');
+    const codecIndex = html.indexOf('<script src="/codex-app-host-message-codec.js"></script>');
+    const bridgeIndex = html.indexOf('<script src="/codex-bridge-polyfill.js"></script>');
     assert.ok(codecIndex >= 0 && bridgeIndex > codecIndex);
   } finally {
     if (previousRoots === undefined) delete process.env.OPENCODEX_PLUGIN_DIRS;
@@ -1669,6 +1717,20 @@ test("only caches content-hashed patched assets as immutable", (t) => {
   assert.match(dynamic.body.toString("utf-8"), /下载文件/);
   assert.equal(fixedName.headers["cache-control"], "no-store");
   assert.equal(legacy.headers["cache-control"], "no-store");
+});
+
+test("serves legacy root-level official app icons from the webview bundle", (t) => {
+  const webviewDir = makeOfficialWebviewDir(t);
+  const appsDir = path.join(webviewDir, "apps");
+  fs.mkdirSync(appsDir, { recursive: true });
+  const iconPath = path.join(appsDir, "vscode.png");
+  fs.writeFileSync(iconPath, Buffer.from([137, 80, 78, 71]));
+  const service = createService(webviewDir);
+
+  assert.equal(service.staticFile("/apps/vscode.png"), iconPath);
+  const response = serveOfficialAssetResponse(service, "/apps/vscode.png");
+  assert.equal(response.status, 200);
+  assert.deepEqual(response.body, Buffer.from([137, 80, 78, 71]));
 });
 
 test("patched asset cache coalesces asynchronous compression and reuses it for ETag validation", async (t) => {
@@ -1804,42 +1866,4 @@ test("patched asset cache honors explicit encoding exclusions and evicts old var
   assert.equal(first.headers["content-encoding"], "gzip");
   assert.equal(service.assetCacheDiagnostics().entries, 1);
   assert.equal(service.assetCacheDiagnostics().bytes <= service.assetCacheDiagnostics().maxBytes, true);
-});
-
-test("official app-menu icons resolve from the site-root /apps/ prefix", (t) => {
-  const webviewDir = makeOfficialWebviewDir(t);
-  const iconPath = path.join(webviewDir, "apps");
-  fs.mkdirSync(iconPath, { recursive: true });
-  fs.writeFileSync(path.join(iconPath, "file-explorer.png"), Buffer.from("89504e470d0a1a0a", "hex"));
-  const service = createService(webviewDir);
-
-  // 官方 main 运行时给出相对路径 apps/file-explorer.png，浏览器按站点根解析成 /apps/。
-  assert.equal(
-    service.staticFile("/apps/file-explorer.png"),
-    path.join(iconPath, "file-explorer.png")
-  );
-  const res = makeResponseRecorder();
-  service.serveFile(
-    { headers: { host: "localhost:3737" } },
-    res,
-    service.staticFile("/apps/file-explorer.png"),
-    200,
-    "/apps/file-explorer.png"
-  );
-  assert.equal(res.status, 200);
-  assert.equal(res.headers["content-type"], "image/png");
-  assert.equal(res.headers["cache-control"], "public, max-age=3600");
-
-  // 官方相对路径在深链路由下会带上前缀，同样要命中的是官方图标目录。
-  assert.equal(
-    service.staticFile("/settings/thread/apps/file-explorer.png"),
-    path.join(iconPath, "file-explorer.png")
-  );
-
-  // 图标映射只能读单个图片文件，不能穿透成整个 webview 目录的第二个读入口。
-  assert.equal(service.staticFile("/apps/../index.html"), null);
-  assert.equal(service.staticFile("/apps/%2e%2e/index.html"), null);
-  assert.equal(service.staticFile("/apps/sub/icon.png"), null);
-  assert.equal(service.staticFile("/apps/missing.png"), null);
-  assert.equal(service.staticFile("/apps/icon.txt"), null);
 });

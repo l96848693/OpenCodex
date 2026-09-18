@@ -34,6 +34,8 @@ const {
 } = require("./core/loopback-host.cjs");
 const { gzipIfUseful, isRequestBodyTooLargeError, readBody, send, sendJson } = require("./http/http-utils.cjs");
 const { createLocalFileService } = require("./http/local-files.cjs");
+const { createMobileApiService } = require("./http/mobile-api.cjs");
+const { createMobileAssetService } = require("./http/mobile-assets.cjs");
 const { createServiceRestartHandler } = require("./http/service-control.cjs");
 const { handleTokenUsageRequest } = require("./http/token-usage.cjs");
 const {
@@ -44,8 +46,10 @@ const {
   handleOfficialNotificationEvent,
   invokeOfficialIpc,
   listOfficialIpcChannels,
+  observeOfficialThread,
   rejectPendingInternalResponses,
   requestContext,
+  setMobileLivePublisher,
   setWsHub,
   startOfficialRuntime,
   webConfigScript,
@@ -59,7 +63,11 @@ const {
   handleRuntimeCompatibilityApi,
 } = require("./http/runtime-compatibility.cjs");
 const { createHistoryPreviewService } = require("./history-preview.cjs");
+const { createMobileDomainService } = require("./mobile/domain-service.cjs");
+const { createWebLeaseManager } = require("./mobile/web-lease.cjs");
+const { createMobileAttachmentService } = require("./mobile/attachment-service.cjs");
 const { createWsHub } = require("./ipc/ws-hub.cjs");
+const { bindMobileLiveEvents } = require("./mobile/live-events.cjs");
 const { workspaceRootsFromIpcPayload } = require("./ipc/workspace-root-context.cjs");
 const { createWorkspaceRootsService } = require("./ipc/workspace-roots.cjs");
 const { diagnosticError, diagnosticLog, diagnosticWarn, sanitizeDiagnosticValue, shortId } = require("./core/diagnostics.cjs");
@@ -210,6 +218,19 @@ function safeClientLogData(value) {
     "requestMethod",
     "responseType",
     "status",
+    "stack",
+    "source",
+    "line",
+    "column",
+    "route",
+    "userAgent",
+    "rejection",
+    "queueType",
+    "messageType",
+    "ttlMs",
+    "state",
+    "previousState",
+    "warning",
     "startedCount",
     "target",
     "totalQueuedCount",
@@ -333,6 +354,7 @@ function installShutdownHandlers(
   server,
   localFiles,
   pickedFiles,
+  mobileAttachments,
   pluginService,
   compatibilityService,
   historyPreview,
@@ -346,6 +368,7 @@ function installShutdownHandlers(
     // 退出时先释放短期 token 和待处理的官方内部请求，避免请求一直挂起。
     localFiles.dispose();
     if (pickedFiles && typeof pickedFiles.dispose === "function") pickedFiles.dispose();
+    if (mobileAttachments && typeof mobileAttachments.dispose === "function") mobileAttachments.dispose();
     if (historyPreview && typeof historyPreview.dispose === "function") historyPreview.dispose();
     if (pluginService && typeof pluginService.dispose === "function") {
       pluginService.dispose(new Error("gateway shutting down"));
@@ -416,6 +439,8 @@ function createRequestHandler({
   historyPreview,
   hiddenRuntimeGcmSockets = new Set(),
   localFiles,
+  mobileApi,
+  mobileAssets,
   pickedFiles,
   pluginService,
   requestRestart = () => false,
@@ -448,12 +473,12 @@ function createRequestHandler({
     if (pathname === "/api/auth/status") return handleAuthStatus(req, res, url);
     if (pathname === "/api/auth/login") return handleAuthLogin(req, res);
     if (pathname === "/api/auth/logout") return handleAuthLogout(req, res, url);
-    if (pathname === "/api/health") {
-      // 健康检查用于外部探活，必须在通用认证门之前允许匿名读取。
-      return sendJson(res, 200, buildGatewayStatus(), { "cache-control": "no-store" });
-    }
     if (pathname === "/api/service/restart") return handleServiceRestart(req, res);
     if (pathname === "/login") return send(res, 302, { location: "/" }, "");
+    if (pathname === "/official" || pathname === "/official/") {
+      // /official 係資源目錄，唔可以當檔案讀；直接導回正式入口，避免 EISDIR 500。
+      return send(res, 302, { location: "/", "cache-control": "no-store" }, "");
+    }
     if (pathname === "/api/launcher/status") {
       // launcher/status 只给桌面壳进程探活，不接受普通浏览器请求。
       if (!isLauncherRequest(req)) {
@@ -464,6 +489,11 @@ function createRequestHandler({
 
     if (handlePublicRuntimeCompatibilityApi(req, res, url, compatibilityService)) return;
 
+    // 独立移动壳只包含公开登录 UI；必须喺官方 SPA fallback 前拦截，避免认证后误回桌面 renderer。
+    if (mobileAssets?.isMobileRequest(req, pathname)) {
+      return mobileAssets.serve(req, res, pathname);
+    }
+
     // 公开静态资源先返回，保证登录页和 web-shell polyfill 在未登录时也能加载。
     if (pathname === "/opencodex-plugin-loader.js" && req.method === "GET") {
       // loader 是目录扫描结果，登录页设置面板也依赖它，所以必须在 auth gate 前动态生成。
@@ -472,6 +502,13 @@ function createRequestHandler({
     if (staticAssets.isPublicStaticPath(pathname)) {
       const file = staticAssets.staticFile(pathname);
       if (file && exists(file)) return staticAssets.serveFile(req, res, file, 200, pathname);
+    }
+
+    if (mobileApi?.isMobileApiPath(pathname)) {
+      const mobileAuth = AUTH_PASSWORD_HASH ? authResultForRequest(req, url) : { authenticated: true, expiresAtMs: null };
+      if (!mobileAuth.authenticated) return mobileApi.sendUnauthorized(req, res);
+      for (const [name, value] of Object.entries(authRefreshHeaders(mobileAuth))) res.setHeader(name, value);
+      return mobileApi.handle(req, res, url, mobileAuth);
     }
 
     if (staticAssets.isAppShellRoute(req, pathname)) {
@@ -533,6 +570,10 @@ function createRequestHandler({
         )
       );
       return send(res, 200, response.headers, response.body);
+    }
+
+    if (pathname === "/api/health") {
+      return sendJson(res, 200, buildGatewayStatus());
     }
 
     if (pathname === "/api/ipc/handlers") {
@@ -872,7 +913,24 @@ async function createGateway() {
   const workspaceRoots = createWorkspaceRootsService();
   const localFiles = createLocalFileService({ getWorkspaceRoots: workspaceRoots.workspaceRoots });
   const pickedFiles = createPickedFilesService();
+  const mobileAttachments = createMobileAttachmentService({ pickedFiles, localFiles });
   const staticAssets = createStaticAssetService({ compatibilityService, getI18nSnapshot, getOfficialBundle });
+  const mobileAssets = createMobileAssetService();
+  const mobileDomain = createMobileDomainService({ transport: pluginService.modelRouter.transport });
+  const mobileLease = createWebLeaseManager();
+  const mobileApi = createMobileApiService({
+    attachments: mobileAttachments,
+    domain: mobileDomain,
+    instanceId: GATEWAY_INSTANCE_ID,
+    getOfficialBundle,
+    serveMobileFile: (pathname, res) => localFiles.serveLocalFile(pathname, res),
+    lease: mobileLease,
+    appServer: {
+      status: () => pluginService.modelRouter.appServerStatus(),
+      restart: () => pluginService.modelRouter.restartAppServer(),
+    },
+    observeThread: (threadId) => observeOfficialThread(threadId, "local"),
+  });
   // 与 request handler 和退出流程共享同一个集合，确保挂起的本机 GCM socket 可被精确回收。
   const hiddenRuntimeGcmSockets = new Set();
   try {
@@ -889,6 +947,8 @@ async function createGateway() {
     historyPreview,
     hiddenRuntimeGcmSockets,
     localFiles,
+    mobileApi,
+    mobileAssets,
     pickedFiles,
     pluginService,
     requestRestart: () => requestRestart(),
@@ -927,6 +987,20 @@ async function createGateway() {
       pluginService.smartSchedulingPresentation?.observeAppHostFrame(frame);
     },
   });
+  const mobileSequence = { value: 0 };
+  setMobileLivePublisher((event) => {
+    mobileSequence.value += 1;
+    webSocketHub.broadcastMobile({ version: 1, sequence: mobileSequence.value, ...event }, { suppressDiagnostic: true });
+  });
+  bindMobileLiveEvents({
+    transport: pluginService.modelRouter.transport,
+    publish: (event) => webSocketHub.broadcastMobile(event, { suppressDiagnostic: true }),
+    sequenceRef: mobileSequence,
+  });
+  pluginService.modelRouter.onAppServerLifecycle?.((state) => {
+    mobileSequence.value += 1;
+    webSocketHub.broadcastMobile({ version: 1, sequence: mobileSequence.value, type: "app_server.state", payload: state }, { suppressDiagnostic: true });
+  });
   pluginService.bindSmartSchedulingPresentation({
     onClientRemoved: webSocketHub.onClientRemoved,
     sendTo: webSocketHub.sendTo,
@@ -937,6 +1011,7 @@ async function createGateway() {
     server,
     localFiles,
     pickedFiles,
+    mobileAttachments,
     pluginService,
     compatibilityService,
     historyPreview,
@@ -953,6 +1028,9 @@ async function createGateway() {
     compatibilityService,
     historyPreview,
     localFiles,
+    mobileAttachments,
+    mobileApi,
+    mobileAssets,
     pluginService,
     server,
     staticAssets,

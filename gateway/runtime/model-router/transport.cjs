@@ -216,6 +216,54 @@ function createAppServerTransport({ processClientMessage, processServerMessage, 
   const internalThreadIds = new Set();
   const internalThreadTombstones = new Map();
   const internalTurnIds = new Set();
+  let restartFactory = null;
+  let restartTimer = null;
+  let stableTimer = null;
+  let restartAttempt = 0;
+  let restartWindowStartedAt = 0;
+  let circuitOpenUntil = 0;
+  let manualRestartUntil = 0;
+  const lifecycleLogs = [];
+  const lifecycleObservers = new Set();
+  let lifecycleState = "starting";
+
+  function lifecycleLog(level, event, details = {}) {
+    lifecycleLogs.push({ time: new Date().toISOString(), level, event, ...details });
+    while (lifecycleLogs.length > 200) lifecycleLogs.shift();
+  }
+
+  function setLifecycleState(state, details = {}) {
+    lifecycleState = state;
+    lifecycleLog(state === "ready" ? "info" : "warn", `app_server_${state}`, details);
+    for (const observer of lifecycleObservers) { try { observer({ state, ...details }); } catch {} }
+  }
+
+  function scheduleRestart() {
+    if (typeof restartFactory !== "function" || restartTimer || Date.now() < circuitOpenUntil) return;
+    const now = Date.now();
+    if (!restartWindowStartedAt || now - restartWindowStartedAt > 30_000) {
+      restartWindowStartedAt = now;
+      restartAttempt = 0;
+    }
+    if (restartAttempt >= 3) {
+      circuitOpenUntil = now + 60_000;
+      setLifecycleState("unavailable", { retryCount: restartAttempt, retryAfterMs: 60_000 });
+      return;
+    }
+    const delayMs = [1_000, 3_000, 10_000][restartAttempt];
+    restartAttempt += 1;
+    setLifecycleState("restarting", { retryCount: restartAttempt, retryAfterMs: delayMs });
+    restartTimer = setTimeout(() => {
+      restartTimer = null;
+      try {
+        const next = restartFactory();
+        if (!next) throw new Error("App Server restart did not return a process");
+      } catch (error) {
+        lifecycleLog("error", "app_server_restart_failed", { retryCount: restartAttempt, error: String(error?.message || error) });
+        scheduleRestart();
+      }
+    }, delayMs);
+  }
 
   function pruneInternalThreadTombstones() {
     const now = Date.now();
@@ -450,6 +498,15 @@ function createAppServerTransport({ processClientMessage, processServerMessage, 
     child = nextChild;
     directStdin = realStdin;
     connectionGeneration += 1;
+    circuitOpenUntil = 0;
+    if (stableTimer) clearTimeout(stableTimer);
+    stableTimer = setTimeout(() => {
+      if (child !== nextChild) return;
+      restartAttempt = 0;
+      restartWindowStartedAt = 0;
+    }, 30_000);
+    stableTimer.unref?.();
+    setLifecycleState("ready", { pid: Number(nextChild.pid) || null, retryCount: restartAttempt });
 
     const clientDecoder = new StringDecoder("utf-8");
     let clientBuffer = "";
@@ -657,12 +714,15 @@ function createAppServerTransport({ processClientMessage, processServerMessage, 
     nextChild.once("close", () => {
       if (child !== nextChild) return;
       child = null;
+      if (stableTimer) clearTimeout(stableTimer);
+      stableTimer = null;
       directStdin = null;
       rejectPending(new AppServerTransportError("App Server process closed", "closed"));
       internalThreadIds.clear();
       internalThreadTombstones.clear();
       internalTurnIds.clear();
       if (typeof onClosed === "function") onClosed();
+      scheduleRestart();
     });
     if (typeof onAttached === "function") onAttached(nextChild);
     return nextChild;
@@ -670,6 +730,36 @@ function createAppServerTransport({ processClientMessage, processServerMessage, 
 
   return {
     decorateChild,
+    setRestartFactory(factory) {
+      restartFactory = typeof factory === "function" ? factory : null;
+    },
+    restart() {
+      if (typeof restartFactory !== "function") return { ok: false, retryAfterMs: 0 };
+      const now = Date.now();
+      if (restartTimer || now < manualRestartUntil) return { ok: false, retryAfterMs: Math.max(0, manualRestartUntil - now) };
+      // 手動重啟先終止舊 App Server，避免新舊 writer 同時存在。
+      try { child?.kill?.(); } catch {}
+      try { directStdin?.destroy?.(); } catch {}
+      restartAttempt = 0;
+      restartWindowStartedAt = Date.now();
+      manualRestartUntil = now + 30_000;
+      scheduleRestart();
+      return { ok: true, retryAfterMs: 30_000 };
+    },
+    lifecycleStatus() {
+      return {
+        state: lifecycleState,
+        pid: child?.pid || null,
+        retryCount: restartAttempt,
+        retryAfterMs: lifecycleState === "restarting" ? 30_000 : lifecycleState === "unavailable" ? Math.max(0, circuitOpenUntil - Date.now()) : Math.max(0, manualRestartUntil - Date.now()),
+        logs: lifecycleLogs.slice(-200).reverse(),
+      };
+    },
+    observeLifecycle(observer) {
+      if (typeof observer !== "function") return () => {};
+      lifecycleObservers.add(observer);
+      return () => lifecycleObservers.delete(observer);
+    },
     isAttached() {
       return !!directStdin && !directStdin.destroyed && !directStdin.writableEnded;
     },

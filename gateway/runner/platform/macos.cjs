@@ -1,7 +1,5 @@
 const fs = require("fs");
 const path = require("path");
-const crypto = require("crypto");
-const asar = require("@electron/asar");
 const { execFileSync } = require("child_process");
 const {
   RUNNER_APP_NAME,
@@ -13,7 +11,6 @@ const {
   isDirectory,
   realpathSafe,
   readJsonIfPresent,
-  withPhysicalAsarAccess,
   writeJson,
 } = require("../shared/fs-utils.cjs");
 const { logLine } = require("../shared/logging.cjs");
@@ -27,10 +24,7 @@ function escapePlistString(value) {
     .replace(/>/g, "&gt;");
 }
 
-function runnerInfoPlist(runnerAsarPath) {
-  // 新版官方 Electron 会校验 ASAR header；必须读取本次生成的 runner，不能沿用官方包或旧缓存的哈希。
-  const header = withPhysicalAsarAccess(() => asar.getRawHeader(runnerAsarPath).headerString);
-  const headerHash = crypto.createHash("sha256").update(header).digest("hex");
+function runnerInfoPlist() {
   /**
    * runner 是后台 gateway 进程，不应该在 Dock 里出现第二个图标。
    * LSUIElement 会让当前官方 Electron runtime 在 ChromeMain 阶段 SIGTRAP；
@@ -56,16 +50,6 @@ function runnerInfoPlist(runnerAsarPath) {
   <string>AtomApplication</string>
   <key>LSBackgroundOnly</key>
   <true/>
-  <key>ElectronAsarIntegrity</key>
-  <dict>
-    <key>Resources/app.asar</key>
-    <dict>
-      <key>algorithm</key>
-      <string>SHA256</string>
-      <key>hash</key>
-      <string>${headerHash}</string>
-    </dict>
-  </dict>
 </dict>
 </plist>
 `;
@@ -150,17 +134,16 @@ async function createMacRunner({ layout, runtimeDir, logger, runCompatibility = 
   fs.copyFileSync(layout.executablePath, runnerExecutablePath);
   fs.chmodSync(runnerExecutablePath, 0o755);
   ensureFrameworksCopy({ layout, runnerFrameworksDir, markerPath: frameworksMarkerPath, logger });
-  // ASAR 完成后才能生成包含最终哈希的 plist；签名必须放在这两步之后。
-  const runnerAsarPath = await runCompatibility(
-    runnerPoints.gatewayAsar,
-    () => writeGatewayAsar({ runnerResourcesDir, workDir })
-  );
   runCompatibility(
     runnerPoints.macosBackgroundBundle,
     () => {
-      fs.writeFileSync(path.join(contentsDir, "Info.plist"), runnerInfoPlist(runnerAsarPath), "utf8");
+      fs.writeFileSync(path.join(contentsDir, "Info.plist"), runnerInfoPlist(), "utf8");
       fs.writeFileSync(path.join(contentsDir, "PkgInfo"), "APPL????", "utf8");
     }
+  );
+  await runCompatibility(
+    runnerPoints.gatewayAsar,
+    () => writeGatewayAsar({ runnerResourcesDir, workDir })
   );
   runCompatibility(
     runnerPoints.macosEntrySignature,

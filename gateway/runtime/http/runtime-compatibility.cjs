@@ -77,24 +77,19 @@ async function handleBrowserReports(req, res, compatibilityService) {
     }
   }
   let accepted = 0;
-  let reportEpoch = "";
-  let resync = false;
   for (const report of reports) {
-    const result = compatibilityService.browserKernelReportResult({
+    const didAccept = compatibilityService.browserKernelReport({
       clientId: parsed.clientId,
       generation: parsed.generation,
       report,
-      reportEpoch: parsed.reportEpoch,
     });
-    if (result.accepted) accepted += 1;
-    if (result.reportEpoch) reportEpoch = result.reportEpoch;
-    resync ||= result.resync === true;
+    if (didAccept) accepted += 1;
   }
   if (accepted !== reports.length) {
     sendJson(res, 400, { ok: false, error: "One or more compatibility reports were rejected" }, { "cache-control": "no-store" });
     return;
   }
-  sendJson(res, 200, { ok: true, accepted, reportEpoch, resync }, { "cache-control": "no-store" });
+  sendJson(res, 200, { ok: true, accepted }, { "cache-control": "no-store" });
 }
 
 async function handleRuntimeCompatibilityApi(req, res, url, compatibilityService) {

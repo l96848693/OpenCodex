@@ -25,11 +25,7 @@
             </div>
           </div>
         </div>
-        <div class="header-statuses">
-          <!-- 健康警告位于 Gateway 状态左侧，可打开完整诊断信息。 -->
-          <button class="status-pill offline" id="healthWarning" type="button" hidden data-i18n="launcher.status.healthWarning">健康异常</button>
-          <div class="status-pill" id="statusPill" data-i18n="launcher.status.starting">启动中</div>
-        </div>
+        <div class="status-pill" id="statusPill" data-i18n="launcher.status.starting">启动中</div>
       </div>
     </header>
 
@@ -150,11 +146,7 @@
 
         <!-- Codex 运行时 -->
         <section class="setting-section">
-          <div class="section-head">
-            <h2>Codex <span class="section-caption" data-i18n="launcher.codex.caption">官方运行时</span></h2>
-            <!-- 仅在存在可用备份时展示还原入口，操作期间禁用按钮。 -->
-            <button id="restoreBundleBackup" class="secondary-btn" hidden disabled data-i18n="launcher.codex.restoreBackup">还原上一版本</button>
-          </div>
+          <h2>Codex <span class="section-caption" data-i18n="launcher.codex.caption">官方运行时</span></h2>
           <div class="setting-list kv">
             <div class="setting-item">
               <div class="setting-label" data-i18n="launcher.codex.version">版本</div>

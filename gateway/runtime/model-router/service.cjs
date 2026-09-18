@@ -648,7 +648,13 @@ function createSmartModelRouterService({
   }
 
   return {
-    decorateAppServerChild: transport.decorateChild,
+    decorateAppServerChild(child, restartFactory) {
+      transport.setRestartFactory(restartFactory);
+      return transport.decorateChild(child);
+    },
+    appServerStatus: transport.lifecycleStatus,
+    onAppServerLifecycle: transport.observeLifecycle,
+    restartAppServer: transport.restart,
     diagnostics() {
       const catalogSnapshot = catalog.snapshot();
       const state = stateStore.snapshot();

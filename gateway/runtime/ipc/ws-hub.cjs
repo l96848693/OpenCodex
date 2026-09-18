@@ -4,7 +4,7 @@ try {
   ({ WebSocketServer } = require("ws"));
 } catch {}
 const { diagnosticLog, diagnosticWarn, shortId } = require("../core/diagnostics.cjs");
-const { DEBUG_LOGS } = require("../core/config.cjs");
+const { DEBUG_LOGS, GATEWAY_INSTANCE_ID } = require("../core/config.cjs");
 const appHostMessageCodec = require("../../../web-shell/codex-app-host-message-codec.js");
 
 // 下面这些阈值只服务于 OPENCODEX_DEBUG_WS=1 的链路排障；默认运行不会采样慢 WS 发送。
@@ -30,6 +30,19 @@ const WS_MAX_BUFFERED_BYTES = Math.max(
   Number(process.env.OPENCODEX_WS_MAX_BUFFERED_BYTES) || 64 * 1024 * 1024
 );
 const APP_HOST_RELAY_MAX_ENTRIES = Math.max(1, Number(process.env.OPENCODEX_APP_HOST_MAX_RELAYS) || 64);
+const APP_HOST_RECONNECT_GRACE_MS = Math.max(
+  1000,
+  Number(process.env.OPENCODEX_APP_HOST_RECONNECT_GRACE_MS) || 30_000
+);
+// BFCache 同普通網絡斷線最多保留五分鐘，避免舊 MessagePort/export ID 無限佔用官方 runtime。
+const APP_HOST_SESSION_TTL_MS = Math.max(
+  60_000,
+  Number(process.env.OPENCODEX_APP_HOST_SESSION_TTL_MS) || 5 * 60_000
+);
+const APP_HOST_DETACHED_QUEUE_MAX_ENTRIES = Math.max(
+  16,
+  Number(process.env.OPENCODEX_APP_HOST_DETACHED_QUEUE_MAX_ENTRIES) || 256
+);
 const WS_IPC_MAX_IN_FLIGHT = Math.max(32, Number(process.env.OPENCODEX_WS_IPC_MAX_IN_FLIGHT) || 4096);
 const ROUTE_ID_SCAN_MAX_NODES = 128;
 const BROADCAST_DEDUPE_MAX_ENTRIES_PER_SOCKET = 16;
@@ -116,6 +129,8 @@ function createWsHub(
     maxBufferedBytes = WS_MAX_BUFFERED_BYTES,
     maxClients = WS_MAX_CLIENTS,
     maxPayloadBytes = WS_MAX_PAYLOAD_BYTES,
+    appHostReconnectGraceMs = APP_HOST_RECONNECT_GRACE_MS,
+    appHostSessionTtlMs = APP_HOST_SESSION_TTL_MS,
     observeAppHostFrame,
   }
 ) {
@@ -148,6 +163,13 @@ function createWsHub(
   let lastAuthRejectLogAtMs = 0;
   let suppressedAuthRejectCount = 0;
   const appHostTraffic = new Map();
+  const effectiveAppHostReconnectGraceMs = Math.max(
+    1,
+    Number(appHostReconnectGraceMs) || APP_HOST_RECONNECT_GRACE_MS
+  );
+  const effectiveAppHostSessionTtlMs = Math.max(1, Number(appHostSessionTtlMs) || APP_HOST_SESSION_TTL_MS);
+  // 短暫斷線期間要保留原本官方 RPC session；export ID 只喺同一 session 內有效，重建會令舊瀏覽器 stub 報錯。
+  const detachedAppHostRelays = new Map();
   let nextAppHostRelayGeneration = 0;
 
   function socketRemoteAddress(socket) {
@@ -424,12 +446,113 @@ function createWsHub(
     return ws.__codexAppHostRelays;
   }
 
+  function detachedRelayEntry(clientId) {
+    return clientId ? detachedAppHostRelays.get(clientId) : null;
+  }
+
+  function flushDetachedAppHostMessages(context) {
+    if (!context || context.terminalState !== "active" || !Array.isArray(context.pendingBrowserMessages)) return;
+    const now = Date.now();
+    while (context.pendingBrowserMessages.length > 0) {
+      const item = context.pendingBrowserMessages[0];
+      if (!item || now - item.enqueuedAtMs >= effectiveAppHostSessionTtlMs) {
+        context.pendingBrowserMessages.shift();
+        continue;
+      }
+      if (!safeSend(context.ws, item.payload, { suppressDiagnostic: true })) return;
+      context.pendingBrowserMessages.shift();
+    }
+  }
+
+  function attachAppHostRelays(ws, clientId, replacedSocket) {
+    let relays = null;
+    if (replacedSocket && replacedSocket !== ws) {
+      relays = replacedSocket.__codexAppHostRelays;
+      replacedSocket.__codexAppHostRelays = new Map();
+    }
+    const detached = detachedRelayEntry(clientId);
+    if ((!relays || relays.size === 0) && detached) relays = detached.relays;
+    if (!relays || relays.size === 0) return;
+    if (detached?.timer) clearTimeout(detached.timer);
+    detachedAppHostRelays.delete(clientId);
+    ws.__codexAppHostRelays = relays;
+    for (const context of relays.values()) {
+      context.ws = ws;
+      context.reconnected = true;
+      context.detached = false;
+      safeSend(ws, { type: "app-host-port-connected", portId: context.portId }, { suppressDiagnostic: true });
+      flushDetachedAppHostMessages(context);
+    }
+  }
+
+  function detachAppHostRelays(ws) {
+    const clientId = socketClientId(ws);
+    const relays = ws.__codexAppHostRelays;
+    if (!clientId || !relays || relays.size === 0) return false;
+    const previous = detachedRelayEntry(clientId);
+    if (previous?.timer) clearTimeout(previous.timer);
+    if (previous?.relays && previous.relays !== relays) {
+      for (const context of [...previous.relays.values()]) {
+        closeAppHostRelay(previous.relays, context, "reconnect_replaced", { notify: false });
+      }
+    }
+    ws.__codexAppHostRelays = new Map();
+    for (const context of relays.values()) context.detached = true;
+    // pagehide.persisted=true 代表頁面入咗 BFCache；此時官方 renderer 仲揸住
+    // 同一組 RPC export ID，唔可以按普通網絡斷線嘅短 grace 釋放 MessagePort。
+    // 要等同一 clientId 嘅頁面恢復並完成 hello，relay 先重新掛返新 WS。
+    const keepForBfcache = ws.__opencodexBfcachePersisted === true;
+    const entry = { relays, timer: null, keepForBfcache };
+    {
+      const expiryMs = keepForBfcache ? effectiveAppHostSessionTtlMs : effectiveAppHostReconnectGraceMs;
+      entry.timer = setTimeout(() => {
+        if (detachedAppHostRelays.get(clientId) !== entry) return;
+        detachedAppHostRelays.delete(clientId);
+        for (const context of [...relays.values()]) {
+          failAppHostRelay(relays, context, new Error("App host reconnect queue expired"), "reconnect_timeout", {
+            code: "queue_expired",
+          });
+        }
+      }, expiryMs);
+      if (entry.timer && typeof entry.timer.unref === "function") entry.timer.unref();
+    }
+    // BFCache 頁面可能長期唔返嚟；限制 detached client 數量，避免無限揸住
+    // 官方 MessagePort。淘汰時只釋放最舊 session，唔影響目前新連線。
+    while (detachedAppHostRelays.size >= Math.max(1, Number(maxAppHostRelays) || 1)) {
+      const [oldestClientId, oldestEntry] = detachedAppHostRelays.entries().next().value || [];
+      if (!oldestClientId || oldestClientId === clientId) break;
+      detachedAppHostRelays.delete(oldestClientId);
+      if (oldestEntry?.timer) clearTimeout(oldestEntry.timer);
+      for (const context of [...(oldestEntry?.relays?.values?.() || [])]) {
+        closeAppHostRelay(oldestEntry.relays, context, "detached_limit", { notify: false });
+      }
+    }
+    detachedAppHostRelays.set(clientId, entry);
+    return true;
+  }
+
+  function handlePageLifecycle(ws, message) {
+    const clientId = normalizedWsClientId(ws, message);
+    if (!clientId || ws.__codexWebClientId !== clientId) return true;
+    if (message.lifecycle !== "pagehide") return true;
+    // 只信瀏覽器明確畀出嘅 persisted 布爾值；普通 unload 仍然用短 grace，
+    // 避免永久保留已關閉頁面嘅官方 MessagePort。
+    ws.__opencodexBfcachePersisted = message.persisted === true;
+    if (DEBUG_LOGS) {
+      diagnosticLog("ws-hub", "page_lifecycle", {
+        clientId: shortId(clientId),
+        persisted: ws.__opencodexBfcachePersisted,
+      });
+    }
+    return true;
+  }
+
   function relayIsCurrent(relays, context) {
     // map 身份和 terminal 状态共同界定当前 relay，旧 generation 的延迟回调不能影响替换端口。
     return !!context && context.terminalState === "active" && relays.get(context.portId) === context;
   }
 
-  function failAppHostRelay(relays, context, error, reason) {
+  function failAppHostRelay(relays, context, error, reason, { code = "" } = {}) {
     if (!context || context.terminalState !== "active") return false;
     if (context.registered && relays.get(context.portId) !== context) return false;
     context.terminalState = "error";
@@ -439,7 +562,12 @@ function createWsHub(
       context.terminalNotified = true;
       safeSend(
         context.ws,
-        { type: "app-host-port-error", portId: context.portId, error: error instanceof Error ? error.message : String(error) },
+        {
+          type: "app-host-port-error",
+          portId: context.portId,
+          error: error instanceof Error ? error.message : String(error),
+          ...(code ? { code } : {}),
+        },
         { suppressDiagnostic: true }
       );
     }
@@ -488,11 +616,12 @@ function createWsHub(
 
   function removeClient(ws) {
     flushAppHostTrafficForClient(socketClientId(ws));
-    closeAppHostRelays(ws, "client_disconnected");
     clients.delete(ws);
     if (ws.__codexWebClientId && clientsById.get(ws.__codexWebClientId) === ws) {
       const clientId = ws.__codexWebClientId;
       clientsById.delete(clientId);
+      // 網絡切換、BFCache 同裝置休眠都會短暫關閉 WS；保留同一 RPC relay 等原頁重連。
+      if (!detachAppHostRelays(ws)) closeAppHostRelays(ws, "client_disconnected");
       for (const listener of clientRemovedListeners) {
         try {
           // 只在当前有效映射真正移除时通知；旧 socket 关闭不能清理已重连的新页面。
@@ -504,6 +633,10 @@ function createWsHub(
           });
         }
       }
+    }
+    else {
+      // 已被新 socket 取代時 relay 早已轉移；若仍有孤兒端口就正常釋放。
+      closeAppHostRelays(ws, "client_disconnected");
     }
   }
 
@@ -527,6 +660,8 @@ function createWsHub(
     const readySockets = [];
     for (const socket of clients) {
       if (socket.readyState !== socket.OPEN) continue;
+      // Mobile 只接收版本化領域事件，唔可以將官方 renderer 廣播原樣灌入獨立前端。
+      if (socket.__opencodexClientKind === "mobile") continue;
       if (terminateBackpressuredSocket(socket, "broadcast")) continue;
       readySockets.push(socket);
     }
@@ -550,6 +685,30 @@ function createWsHub(
         clientCount: clients.size,
         sent,
       });
+    }
+    return sent;
+  }
+
+  /** Mobile 只接收經領域層收窄嘅版本化事件，唔同官方 renderer 共用廣播面。 */
+  function broadcastMobile(payload, options = {}) {
+    let sent = 0;
+    let prepared = null;
+    for (const socket of clients) {
+      if (socket.readyState !== socket.OPEN || socket.__opencodexClientKind !== "mobile") continue;
+      if (terminateBackpressuredSocket(socket, "mobile_broadcast")) continue;
+      try {
+        prepared ||= stringifyForWs(payload);
+        if (sendPrepared(socket, payload, prepared.message, {
+          ...options,
+          route: "mobile_broadcast",
+          stringifyMs: prepared.stringifyMs,
+        })) sent += 1;
+      } catch (error) {
+        diagnosticWarn("ws-hub", "mobile_broadcast_failed", {
+          ...wsPayloadSummary(payload),
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
     }
     return sent;
   }
@@ -643,6 +802,14 @@ function createWsHub(
     const relays = appHostRelaysForSocket(ws);
     const existing = relays.get(portId);
     if (existing) {
+      if (existing.terminalState === "active" && existing.ws === ws && existing.reconnected) {
+        // 重連後瀏覽器會重發 connect；呢個只係同一 MessagePort 握手，唔可以重建官方 RPC session。
+        existing.reconnected = false;
+        existing.detached = false;
+        flushDetachedAppHostMessages(existing);
+        safeSend(ws, { type: "app-host-port-connected", portId }, { suppressDiagnostic: true });
+        return true;
+      }
       // 同一个页面重复使用 portId 时以后到者为准，先关闭旧 relay 避免双写。
       relays.delete(portId);
       existing.registered = false;
@@ -665,6 +832,8 @@ function createWsHub(
       portId,
       clientId,
       ws,
+      detached: false,
+      pendingBrowserMessages: [],
       relay: null,
       registered: false,
       terminalNotified: false,
@@ -706,11 +875,16 @@ function createWsHub(
             failAppHostRelay(relays, context, new Error("Invalid app-host transport data"), "encode_failed");
             return;
           }
-          const sent = safeSend(
-            context.ws,
-            { type: "app-host-port-message", portId, ...wireData },
-            { suppressDiagnostic: true }
-          );
+          const browserMessage = { type: "app-host-port-message", portId, ...wireData };
+          if (context.detached) {
+            if (context.pendingBrowserMessages.length >= APP_HOST_DETACHED_QUEUE_MAX_ENTRIES) {
+              failAppHostRelay(relays, context, new Error("App host reconnect queue is full"), "reconnect_queue_full");
+              return;
+            }
+            context.pendingBrowserMessages.push({ payload: browserMessage, enqueuedAtMs: Date.now() });
+            return;
+          }
+          const sent = safeSend(context.ws, browserMessage, { suppressDiagnostic: true });
           if (!sent) {
             failAppHostRelay(
               relays,
@@ -904,6 +1078,7 @@ function createWsHub(
       // 通知 click/close 只从已认证 WS 回传；hub 不理解官方通知语义，直接交回 runtime 的 fake Notification。
       return typeof handleNotificationEvent === "function" ? handleNotificationEvent(message, ws, req) : true;
     }
+    if (message.type === "opencodex:page-lifecycle") return handlePageLifecycle(ws, message);
     if (message.type === "app-host-connect") return handleAppHostConnect(ws, req, message);
     if (message.type === "app-host-port-message") return handleAppHostPortMessage(ws, req, message);
     return false;
@@ -942,8 +1117,40 @@ function createWsHub(
         try {
           const message = JSON.parse(String(raw));
           const clientId = message && typeof message.clientId === "string" ? message.clientId : "";
+          if (message?.type === "mobile:hello" && clientId) {
+            if (message.gatewayInstanceId !== GATEWAY_INSTANCE_ID) {
+              try {
+                ws.send(JSON.stringify({ type: "gateway-session-expired", gatewayInstanceId: GATEWAY_INSTANCE_ID }));
+                ws.close(4001, "gateway-session-expired");
+              } catch {}
+              return;
+            }
+            ws.__opencodexClientKind = "mobile";
+            ws.__opencodexMobileClientId = clientId;
+            try {
+              ws.send(JSON.stringify({
+                type: "mobile:hello-ack",
+                clientId,
+                gatewayInstanceId: GATEWAY_INSTANCE_ID,
+              }));
+            } catch (error) {
+              diagnosticWarn("ws-hub", "mobile_hello_ack_failed", {
+                clientId: shortId(clientId),
+                error: error instanceof Error ? error.message : String(error),
+              });
+            }
+            return;
+          }
           // hello 是浏览器接入 IPC 的握手消息，拿到 clientId 后才能定向投递事件。
           if (message && message.type === "hello" && clientId) {
+            if (message.gatewayInstanceId !== GATEWAY_INSTANCE_ID) {
+              // Gateway 重啟後舊頁面仍持有上一代 AppHost export ID，必須拒絕復連並要求重新整理。
+              try {
+                ws.send(JSON.stringify({ type: "gateway-session-expired", gatewayInstanceId: GATEWAY_INSTANCE_ID }));
+                ws.close(4001, "gateway-session-expired");
+              } catch {}
+              return;
+            }
             const previousClientId = ws.__codexWebClientId;
             if (previousClientId && previousClientId !== clientId && clientsById.get(previousClientId) === ws) {
               clientsById.delete(previousClientId);
@@ -961,6 +1168,7 @@ function createWsHub(
             // 后来重复 hello 时切到最新连接，并让旧 socket 进入 CLOSING，避免重连窗口内重复接收大广播。
             const replacedSocket = clientsById.get(clientId);
             ws.__codexWebClientId = clientId;
+            attachAppHostRelays(ws, clientId, replacedSocket);
             clientsById.set(clientId, ws);
             if (replacedSocket && replacedSocket !== ws) {
               try {
@@ -977,7 +1185,7 @@ function createWsHub(
             }
             try {
               // ack 明确告诉浏览器：clientId 已经进入路由表，可以开始发会产生异步回包的官方 IPC。
-              ws.send(JSON.stringify({ type: "hello-ack", clientId }));
+              ws.send(JSON.stringify({ type: "hello-ack", clientId, gatewayInstanceId: GATEWAY_INSTANCE_ID }));
               if (DEBUG_LOGS) diagnosticLog("ws-hub", "hello_ack", { clientId: shortId(clientId) });
             } catch (error) {
               diagnosticWarn("ws-hub", "hello_ack_failed", {
@@ -1031,7 +1239,7 @@ function createWsHub(
     });
   });
 
-  return { broadcast, clients, sendTo, hasClient, onClientReady, onClientRemoved };
+  return { broadcast, broadcastMobile, clients, sendTo, hasClient, onClientReady, onClientRemoved };
 }
 
 module.exports = {

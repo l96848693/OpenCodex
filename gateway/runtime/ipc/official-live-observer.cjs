@@ -7,6 +7,319 @@ const DEFAULT_CLIENT_TYPE = "opencodex-readonly-observer";
 const DEFAULT_RECONNECT_DELAY_MS = 5_000;
 const DEFAULT_MAX_RECONNECT_DELAY_MS = 60_000;
 const DEFAULT_MAX_KNOWN_THREADS = 512;
+const DEFAULT_MAX_MOBILE_STREAM_STATES = 64;
+const MOBILE_STREAM_TEXT_LIMIT = 32_000;
+const MOBILE_STREAM_MAX_INITIAL_ITEMS = 32;
+
+const STREAMING_STATUSES = new Set(["pending", "in_progress", "inprogress", "running", "started", "streaming", "active"]);
+const TERMINAL_STATUSES = new Set(["completed", "complete", "succeeded", "success", "done", "failed", "failure", "error", "interrupted", "cancelled", "canceled", "stopped", "aborted"]);
+
+function boundedStreamText(value) {
+  const text = typeof value === "string" || typeof value === "number" ? String(value) : "";
+  return text.length > MOBILE_STREAM_TEXT_LIMIT ? text.slice(0, MOBILE_STREAM_TEXT_LIMIT) : text;
+}
+
+function streamStatus(value) {
+  const raw = value && typeof value === "object" ? value.type ?? value.status ?? value.state ?? value.value : value;
+  const normalized = String(raw ?? "").trim().toLowerCase().replace(/[\s-]+/g, "_");
+  if (STREAMING_STATUSES.has(normalized)) return "streaming";
+  if (normalized === "failed" || normalized === "failure" || normalized === "error") return "failed";
+  if (normalized === "interrupted" || normalized === "cancelled" || normalized === "canceled" || normalized === "stopped" || normalized === "aborted") return "cancelled";
+  if (normalized === "completed" || normalized === "complete" || normalized === "succeeded" || normalized === "success" || normalized === "done") return "completed";
+  return "unknown";
+}
+
+function runtimeIsActive(value) {
+  const raw = value && typeof value === "object"
+    ? value.type ?? value.status ?? value.state ?? value.value
+    : value;
+  const normalized = String(raw ?? "").trim().toLowerCase().replace(/[\s-]+/g, "_");
+  return STREAMING_STATUSES.has(normalized);
+}
+
+function streamId(value) {
+  if (typeof value === "string" || typeof value === "number") return String(value).slice(0, 200);
+  if (!value || typeof value !== "object") return "";
+  return String(value.id || value.turnId || value.turn_id || "").slice(0, 200);
+}
+
+function streamItemKind(item) {
+  const type = String(item?.type || "").trim().toLowerCase();
+  const phase = streamItemPhase(item);
+  if (["usermessage", "user_message"].includes(type)) return "user";
+  if (["agentmessage", "agent_message", "assistant-message", "assistant_message"].includes(type)) {
+    return !phase || phase === "final" || phase === "final_answer" ? "message" : "reasoning";
+  }
+  if (["reasoning", "plan", "proposed-plan", "proposed_plan"].includes(type)) return "reasoning";
+  if (["commandexecution", "filechange", "mcptoolcall", "dynamictoolcall", "websearch", "toolcall", "toolresult"].includes(type)) return "reasoning";
+  return "";
+}
+
+function streamItemPhase(item) {
+  const phase = typeof item?.phase === "string"
+    ? item.phase.trim().toLowerCase()
+    : typeof item?.metadata?.phase === "string"
+      ? item.metadata.phase.trim().toLowerCase()
+      : "";
+  return phase || "";
+}
+
+function streamItemText(item) {
+  if (!item || typeof item !== "object") return "";
+  if (typeof item.text === "string") return boundedStreamText(item.text);
+  if (Array.isArray(item.summary)) return boundedStreamText(item.summary.map((part) => String(part || "")).filter(Boolean).join("\n"));
+  if (Array.isArray(item.content)) {
+    return boundedStreamText(item.content.map((part) => {
+      if (typeof part === "string") return part;
+      return ["text", "Text"].includes(String(part?.type || "")) ? String(part.text || "") : "";
+    }).filter(Boolean).join("\n"));
+  }
+  return "";
+}
+
+function streamItemId(item, fallback) {
+  return String(item?.id || item?.itemId || item?.item_id || fallback || "").slice(0, 200);
+}
+
+function turnLike(value, key = "") {
+  if (!value || typeof value !== "object") return false;
+  return Boolean(streamId(value) || value.turn_status || value.turnStatus || value.status || /^turn:/.test(key));
+}
+
+function projectTurn(value, index = 0, key = "") {
+  if (!turnLike(value, key)) return null;
+  const id = streamId(value) || (key.startsWith("turn:") ? key.slice(5) : `turn_${index}`);
+  if (!id) return null;
+  const items = Array.isArray(value.items)
+    ? value.items
+    : Array.isArray(value.outputItems)
+      ? value.outputItems
+      : Array.isArray(value.output_items)
+        ? value.output_items
+        : [];
+  return {
+    id,
+    status: streamStatus(value.status ?? value.turn_status ?? value.turnStatus ?? value.state),
+    startedAt: Number(value.turnStartedAtMs || value.turn_started_at_ms || value.createdAt || 0) || 0,
+    items: items.map((item, itemIndex) => ({
+      id: streamItemId(item, `item_${id}_${itemIndex}`),
+      kind: streamItemKind(item),
+      phase: streamItemPhase(item),
+      text: streamItemText(item),
+      index: itemIndex,
+    })),
+  };
+}
+
+function projectConversationState(state) {
+  if (!state || typeof state !== "object") return { turns: [], activeTurnId: null, runtimeActive: false };
+  const turns = [];
+  const add = (value, index, key) => {
+    const turn = projectTurn(value, index, key);
+    if (!turn || turns.some((candidate) => candidate.id === turn.id)) return;
+    turns.push(turn);
+  };
+  (Array.isArray(state.turns) ? state.turns : []).forEach((turn, index) => add(turn, index, ""));
+  const entities = state.turnHistory?.history?.entitiesByKey;
+  if (entities && typeof entities === "object") {
+    Object.entries(entities).forEach(([key, value], index) => add(value, index, key));
+  }
+  const runtimeActive = runtimeIsActive(state.threadRuntimeStatus);
+  let active = turns
+    .filter((turn) => turn.status === "streaming")
+    .sort((left, right) => (right.startedAt - left.startedAt) || turns.indexOf(right) - turns.indexOf(left))
+    .at(0);
+  // 官方偶尔会先把 turn entity 写成 stopped，再更新 threadRuntimeStatus。
+  // runtime 仍是 active 时，不能将旧终态投影给 Mobile；取最新 turn 作为当前活动回合。
+  if (!active && runtimeActive) {
+    active = [...turns]
+      .sort((left, right) => (right.startedAt - left.startedAt) || turns.indexOf(right) - turns.indexOf(left))
+      .at(0);
+  }
+  return { turns, activeTurnId: active?.id || null, runtimeActive };
+}
+
+function decodeJsonPointer(value) {
+  return String(value || "").replace(/~1/g, "/").replace(/~0/g, "~");
+}
+
+function patchTurnId(record, path) {
+  const parts = String(path || "").split("/").slice(1).map(decodeJsonPointer);
+  const entityKey = parts.find((part) => part.startsWith("turn:"));
+  if (entityKey) return entityKey.slice(5);
+  if (record.entityTurnIds && parts.includes("entitiesByKey")) {
+    const entityIndex = parts.indexOf("entitiesByKey");
+    const entityKeyValue = parts[entityIndex + 1];
+    if (entityKeyValue && record.entityTurnIds.has(entityKeyValue)) return record.entityTurnIds.get(entityKeyValue);
+  }
+  if (parts[0] === "turns" && /^\d+$/.test(parts[1] || "")) return record.turnIndex[Number(parts[1])] || "";
+  return "";
+}
+
+function upsertProjectedTurn(record, value, index, key) {
+  const next = projectTurn(value, index, key);
+  if (!next) return null;
+  const previous = record.turns.get(next.id);
+  record.turns.set(next.id, next);
+  if (!record.turnIndex.includes(next.id) && Number.isInteger(index)) record.turnIndex[index] = next.id;
+  return { previous, next };
+}
+
+function applyStreamPatch(record, patch) {
+  if (!patch || typeof patch !== "object") return null;
+  const parts = String(patch.path || "").split("/").slice(1).map(decodeJsonPointer);
+  const turnId = patchTurnId(record, patch.path);
+  if (!turnId) return null;
+  let turn = record.turns.get(turnId);
+  if (!turn && patch.value && typeof patch.value === "object") {
+    const result = upsertProjectedTurn(record, patch.value, parts[0] === "turns" ? Number(parts[1]) : -1, `turn:${turnId}`);
+    turn = result?.next || null;
+  }
+  if (!turn) return null;
+  const itemIndex = parts.indexOf("items");
+  if (itemIndex < 0) {
+    if (parts.at(-1) === "status" || parts.at(-1) === "turn_status" || parts.at(-1) === "turnStatus" || parts.at(-1) === "state") {
+      const previous = turn.status;
+      turn.status = streamStatus(patch.value);
+      return { turnId, previousStatus: previous, status: turn.status, item: null };
+    }
+    if (parts.length <= 1 && patch.value && typeof patch.value === "object") {
+      const result = upsertProjectedTurn(record, patch.value, -1, `turn:${turnId}`);
+      return result ? { turnId, previousStatus: result.previous?.status || "unknown", status: result.next.status, item: null } : null;
+    }
+    return null;
+  }
+  const rawItemIndex = parts[itemIndex + 1];
+  const numericItemIndex = /^\d+$/.test(rawItemIndex || "") ? Number(rawItemIndex) : -1;
+  const itemId = numericItemIndex >= 0 ? turn.items[numericItemIndex]?.id || `item_${turnId}_${numericItemIndex}` : rawItemIndex || "";
+  let item = turn.items.find((candidate) => candidate.id === itemId);
+  if (!item && patch.value && typeof patch.value === "object") {
+    item = { id: itemId || streamItemId(patch.value, `item_${turnId}_${turn.items.length}`), kind: streamItemKind(patch.value), phase: streamItemPhase(patch.value), text: streamItemText(patch.value), index: turn.items.length };
+    turn.items.push(item);
+  }
+  if (!item) return null;
+  if (parts.length === itemIndex + 2 && patch.value && typeof patch.value === "object") {
+    item.kind = streamItemKind(patch.value) || item.kind;
+    item.phase = streamItemPhase(patch.value) || item.phase;
+    item.text = streamItemText(patch.value);
+  } else if (parts.at(-1) === "text") {
+    item.text = boundedStreamText(patch.value);
+  } else if (parts.at(-1) === "summary") {
+    item.kind = "reasoning";
+    item.text = Array.isArray(patch.value) ? boundedStreamText(patch.value.map((part) => String(part || "")).join("\n")) : boundedStreamText(patch.value);
+  } else if (parts.at(-1) === "content") {
+    item.text = streamItemText({ content: patch.value });
+  }
+  return { turnId, previousStatus: turn.status, status: turn.status, item };
+}
+
+function createOfficialMobileStreamProjector(options = {}) {
+  const publish = typeof options.publish === "function" ? options.publish : () => {};
+  const maxStates = Math.max(1, Number(options.maxStates) || DEFAULT_MAX_MOBILE_STREAM_STATES);
+  const states = new Map();
+
+  function keyFor(threadId, hostId) { return threadKey(threadId, hostId); }
+  function getOrCreate(threadId, hostId) {
+    const key = keyFor(threadId, hostId);
+    let record = states.get(key);
+    if (!record) {
+      record = { threadId, hostId, revision: null, activeTurnId: null, runtimeActive: false, turns: new Map(), turnIndex: [], entityTurnIds: new Map(), emittedStatus: new Map(), emittedText: new Map() };
+    }
+    states.delete(key);
+    states.set(key, record);
+    while (states.size > maxStates) states.delete(states.keys().next().value);
+    return record;
+  }
+  function eventState(record, turnId, status) {
+    if (!turnId || !["streaming", "completed", "cancelled", "failed"].includes(status)) return;
+    const previous = record.emittedStatus.get(turnId);
+    if (previous === status) return;
+    record.emittedStatus.set(turnId, status);
+    publish({ type: "thread.turn.state", threadId: record.threadId, payload: { turnId, status } });
+  }
+  function eventDelta(record, turn, item) {
+    if (!item?.id || !item.kind || !item.text) return;
+    const cacheKey = `${turn.id}\u0000${item.id}`;
+    const previous = record.emittedText.get(cacheKey) || "";
+    let delta = item.text;
+    if (item.text.startsWith(previous)) delta = item.text.slice(previous.length);
+    else if (previous.startsWith(item.text)) return;
+    else delta = item.text;
+    record.emittedText.set(cacheKey, item.text);
+    if (!delta) return;
+    publish({ type: "thread.message.delta", threadId: record.threadId, payload: { turnId: turn.id, itemId: item.id, kind: item.kind, delta, ...(item.phase ? { phase: item.phase } : {}) } });
+  }
+  function consume(message) {
+    const params = message?.params && typeof message.params === "object" ? message.params : {};
+    const threadId = typeof params.conversationId === "string" ? params.conversationId : "";
+    const hostId = typeof params.hostId === "string" && params.hostId ? params.hostId : DEFAULT_HOST_ID;
+    const change = params.change && typeof params.change === "object" ? params.change : null;
+    if (!threadId || !change) return;
+    const record = getOrCreate(threadId, hostId);
+    if (change.type === "snapshot") {
+      const projected = projectConversationState(change.conversationState);
+      const previousActive = record.activeTurnId;
+      record.turns = new Map(projected.turns.map((turn) => [turn.id, turn]));
+      record.turnIndex = projected.turns.map((turn) => turn.id);
+      record.entityTurnIds = new Map();
+      const entities = change.conversationState?.turnHistory?.history?.entitiesByKey;
+      if (entities && typeof entities === "object") {
+        Object.entries(entities).forEach(([key, value], index) => {
+          const turn = projectTurn(value, index, key);
+          if (turn) record.entityTurnIds.set(key, turn.id);
+        });
+      }
+      record.revision = change.revision ?? null;
+      record.activeTurnId = projected.activeTurnId;
+      record.runtimeActive = projected.runtimeActive;
+      if (record.activeTurnId) {
+        eventState(record, record.activeTurnId, "streaming");
+        const active = record.turns.get(record.activeTurnId);
+        active?.items.slice(-MOBILE_STREAM_MAX_INITIAL_ITEMS).forEach((item) => eventDelta(record, active, item));
+      } else if (previousActive) {
+        const previousTurn = record.turns.get(previousActive);
+        const terminal = previousTurn?.status;
+        if (terminal && terminal !== "streaming") eventState(record, previousActive, terminal);
+      }
+      return;
+    }
+    if (change.type !== "patches" || record.revision !== change.baseRevision || !Array.isArray(change.patches)) return;
+    const changed = [];
+    for (const patch of change.patches) {
+      const patchPath = String(patch?.path || "");
+      if (patchPath === "/threadRuntimeStatus" || patchPath.startsWith("/threadRuntimeStatus/")) {
+        record.runtimeActive = runtimeIsActive(patch.value);
+      }
+      const result = applyStreamPatch(record, patch);
+      if (result) changed.push(result);
+    }
+    record.revision = change.revision ?? record.revision;
+    const previousActive = record.activeTurnId;
+    const active = [...record.turns.values()]
+      .filter((turn) => turn.status === "streaming")
+      .sort((left, right) => (right.startedAt - left.startedAt) || record.turnIndex.indexOf(right.id) - record.turnIndex.indexOf(left.id))
+      .at(0);
+    const effectiveActive = active || (record.runtimeActive
+      ? [...record.turns.values()]
+        .sort((left, right) => (right.startedAt - left.startedAt) || record.turnIndex.indexOf(right.id) - record.turnIndex.indexOf(left.id))
+        .at(0)
+      : null);
+    record.activeTurnId = effectiveActive?.id || null;
+    if (record.activeTurnId) eventState(record, record.activeTurnId, "streaming");
+    for (const result of changed) {
+      const effectiveStatus = record.runtimeActive && result.turnId === record.activeTurnId ? "streaming" : result.status;
+      if (effectiveStatus && effectiveStatus !== "unknown" && effectiveStatus !== "streaming") eventState(record, result.turnId, effectiveStatus);
+      if (result.item && effectiveStatus === "streaming") eventDelta(record, record.turns.get(result.turnId), result.item);
+    }
+    if (!record.activeTurnId && previousActive && !changed.some((result) => result.turnId === previousActive && result.status !== "streaming")) {
+      const previousTurn = record.turns.get(previousActive);
+      if (previousTurn?.status && previousTurn.status !== "unknown") eventState(record, previousActive, previousTurn.status);
+    }
+  }
+  function forget(threadId, hostId = DEFAULT_HOST_ID) { states.delete(keyFor(threadId, hostId)); }
+  function reset() { states.clear(); }
+  return { consume, forget, reset, __test: { getStates: () => new Map(states), projectConversationState, applyStreamPatch } };
+}
 
 function threadKey(conversationId, hostId) {
   return `${hostId}\u0000${conversationId}`;
@@ -98,6 +411,10 @@ function createOfficialLiveObserver(options = {}) {
   const socketFactory =
     typeof options.socketFactory === "function" ? options.socketFactory : (socketPath) => net.createConnection(socketPath);
   const publish = typeof options.publish === "function" ? options.publish : () => {};
+  const mobileProjector = createOfficialMobileStreamProjector({
+    publish: typeof options.publishMobile === "function" ? options.publishMobile : undefined,
+    maxStates: options.maxMobileStreamStates,
+  });
   const onError = typeof options.onError === "function" ? options.onError : () => {};
   const clientType = options.clientType || DEFAULT_CLIENT_TYPE;
   const reconnectDelayMs =
@@ -155,6 +472,7 @@ function createOfficialLiveObserver(options = {}) {
     }
     activeOwners.clear();
     activeRevisions.clear();
+    mobileProjector.reset();
   }
 
   function emitConnectionReset(reason, sourceMessage = null) {
@@ -204,6 +522,8 @@ function createOfficialLiveObserver(options = {}) {
     knownThreads.delete(key);
     activeOwners.delete(key);
     activeRevisions.delete(key);
+    const separator = key.indexOf("\u0000");
+    if (separator >= 0) mobileProjector.forget(key.slice(separator + 1), key.slice(0, separator));
     if (notifyOfficial && clientId) sendFollowing(thread.conversationId, thread.hostId, false);
     return true;
   }
@@ -275,6 +595,7 @@ function createOfficialLiveObserver(options = {}) {
           activeRevisions.delete(key);
         }
         emit(method, message);
+        mobileProjector.consume(message);
         return;
       }
       if (change?.type !== "patches") return;
@@ -283,6 +604,7 @@ function createOfficialLiveObserver(options = {}) {
       if (change.revision === undefined || change.revision === null) return;
       activeRevisions.set(key, change.revision);
       emit(method, message);
+      mobileProjector.consume(message);
       return;
     }
 
@@ -296,6 +618,8 @@ function createOfficialLiveObserver(options = {}) {
         if (ownerClientId !== params.clientId) continue;
         activeOwners.delete(thread);
         activeRevisions.delete(thread);
+        const separator = thread.indexOf("\u0000");
+        if (separator >= 0) mobileProjector.forget(thread.slice(separator + 1), thread.slice(0, separator));
         matched = true;
       }
       // client-status-changed 是 owner 级别的全局事件，多个 thread 只需向 renderer 转发一次。
@@ -379,6 +703,9 @@ function createOfficialLiveObserver(options = {}) {
     if (typeof conversationId !== "string" || conversationId.length === 0) return false;
     const normalizedHostId = typeof hostId === "string" && hostId ? hostId : DEFAULT_HOST_ID;
     rememberKnownThread(conversationId, normalizedHostId);
+    // Mobile 頁面可能喺 observer 已經訂閱後先建立 WS；清掉 projector 去重游標，
+    // 等下一份官方 snapshot 將目前活動 turn 重新發送畀新頁面。
+    mobileProjector.forget(conversationId, normalizedHostId);
     if (clientId) sendFollowing(conversationId, normalizedHostId, true);
     return true;
   }
@@ -434,8 +761,10 @@ function createOfficialLiveObserver(options = {}) {
       getActiveOwners: () => new Map(activeOwners),
       getClientId: () => clientId,
       getKnownThreads: () => new Map(knownThreads),
+      getMobileStreamStates: () => mobileProjector.__test.getStates(),
       handleMessage,
       encodeIpcFrame,
+      mobileProjector,
     },
   };
 }
@@ -443,6 +772,7 @@ function createOfficialLiveObserver(options = {}) {
 module.exports = {
   createIpcFrameParser,
   createOfficialLiveObserver,
+  createOfficialMobileStreamProjector,
   encodeIpcFrame,
   __test: {
     DEFAULT_CLIENT_TYPE,
@@ -451,6 +781,9 @@ module.exports = {
     DEFAULT_MAX_RECONNECT_DELAY_MS,
     IPC_MAX_FRAME_BYTES,
     IPC_FRAME_HEADER_BYTES,
+    DEFAULT_MAX_MOBILE_STREAM_STATES,
+    MOBILE_STREAM_TEXT_LIMIT,
+    MOBILE_STREAM_MAX_INITIAL_ITEMS,
     isExpectedSocketUnavailableError,
     reconnectDelayForAttempt,
     threadKey,

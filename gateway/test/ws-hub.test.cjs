@@ -4,7 +4,12 @@ const test = require("node:test");
 const WebSocket = require("ws");
 
 const { createWsHub, __test } = require("../runtime/ipc/ws-hub.cjs");
+const { GATEWAY_INSTANCE_ID } = require("../runtime/core/config.cjs");
 const appHostMessageCodec = require("../../web-shell/codex-app-host-message-codec.js");
+
+function hello(clientId, gatewayInstanceId = GATEWAY_INSTANCE_ID) {
+  return JSON.stringify({ type: "hello", clientId, gatewayInstanceId });
+}
 
 function waitForMessage(socket, predicate) {
   return new Promise((resolve, reject) => {
@@ -42,7 +47,7 @@ test("recreates an app-host relay when the browser WebSocket reconnects", async 
   const relays = [];
   const sockets = [];
   createWsHub(server, {
-    createAppHostRelay() {
+    createAppHostRelay(options) {
       let resolveClosed;
       const relay = {
         closed: false,
@@ -50,6 +55,7 @@ test("recreates an app-host relay when the browser WebSocket reconnects", async 
           resolveClosed = resolve;
         }),
         messages: [],
+        onMessage: options.onMessage,
         close() {
           this.closed = true;
           resolveClosed();
@@ -81,25 +87,36 @@ test("recreates an app-host relay when the browser WebSocket reconnects", async 
   const first = new WebSocket(url);
   sockets.push(first);
   await waitForOpen(first);
-  first.send(JSON.stringify({ type: "hello", clientId }));
+  first.send(hello(clientId));
   await waitForMessage(first, (message) => message.type === "hello-ack");
   first.send(JSON.stringify({ type: "app-host-connect", clientId, portId }));
   await waitForMessage(first, (message) => message.type === "app-host-port-connected");
   assert.equal(relays.length, 1);
 
-  // 服务端会在旧 WS 关闭时释放 relay；新 WS 的第一帧必须能恢复同一个浏览器 MessagePort。
+  // 短暂断线不可释放官方 relay；新 WS 必须恢复同一个浏览器 MessagePort/RPC session。
   first.close();
   await waitForClose(first);
-  await relays[0].closedPromise;
-  assert.equal(relays[0].closed, true);
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.equal(relays[0].closed, false);
+  // 官方回包在断线窗口不能丢失，重连后应按 FIFO 补发到浏览器。
+  relays[0].onMessage("server-event-during-reconnect");
 
   const second = new WebSocket(url);
   sockets.push(second);
   await waitForOpen(second);
-  second.send(JSON.stringify({ type: "hello", clientId }));
+  const reconnectedPort = waitForMessage(
+    second,
+    (message) => message.type === "app-host-port-connected" && message.portId === portId
+  );
+  const queuedServerEvent = waitForMessage(
+    second,
+    (message) => message.type === "app-host-port-message" && message.data === "server-event-during-reconnect"
+  );
+  second.send(hello(clientId));
   await waitForMessage(second, (message) => message.type === "hello-ack");
+  await reconnectedPort;
+  await queuedServerEvent;
   second.send(JSON.stringify({ type: "app-host-port-message", clientId, portId, data: "thread/list" }));
-  await waitForMessage(second, (message) => message.type === "app-host-port-connected");
 
   const structuredData = { id: 9n, payload: new Uint8Array([1, 2, 3]), sentAt: new Date(4567) };
   second.send(
@@ -111,15 +128,15 @@ test("recreates an app-host relay when the browser WebSocket reconnects", async 
     })
   );
   const deadline = Date.now() + 2_000;
-  while (relays[1].messages.length < 2 && Date.now() < deadline) {
+  while (relays[0].messages.length < 2 && Date.now() < deadline) {
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
 
-  assert.equal(relays.length, 2);
-  assert.equal(relays[1].messages[0], "thread/list");
-  assert.equal(relays[1].messages[1].id, 9n);
-  assert.deepEqual(Array.from(relays[1].messages[1].payload), [1, 2, 3]);
-  assert.equal(relays[1].messages[1].sentAt.getTime(), 4567);
+  assert.equal(relays.length, 1);
+  assert.equal(relays[0].messages[0], "thread/list");
+  assert.equal(relays[0].messages[1].id, 9n);
+  assert.deepEqual(Array.from(relays[0].messages[1].payload), [1, 2, 3]);
+  assert.equal(relays[0].messages[1].sentAt.getTime(), 4567);
 });
 
 test("caps app-host relays per browser socket", async (t) => {
@@ -148,7 +165,7 @@ test("caps app-host relays per browser socket", async (t) => {
     await new Promise((resolve) => server.close(resolve));
   });
   await waitForOpen(socket);
-  socket.send(JSON.stringify({ type: "hello", clientId: "relay-limit-client" }));
+  socket.send(hello("relay-limit-client"));
   await waitForMessage(socket, (message) => message.type === "hello-ack");
 
   for (let index = 0; index < 3; index += 1) {
@@ -190,7 +207,7 @@ test("routes browser IPC over the authenticated websocket and preserves request 
     await new Promise((resolve) => server.close(resolve));
   });
   await waitForOpen(socket);
-  socket.send(JSON.stringify({ type: "hello", clientId: "ipc-client" }));
+  socket.send(hello("ipc-client"));
   await waitForMessage(socket, (message) => message.type === "hello-ack");
 
   // clientId 必须来自 hello 后的 socket 身份；业务 request 只携带 channel/args。
@@ -328,7 +345,7 @@ test("closes a relay and reports malformed app-host wire data", async (t) => {
     if (message.type.startsWith("app-host-port-")) appHostEvents.push(message.type);
   });
   await waitForOpen(socket);
-  socket.send(JSON.stringify({ type: "hello", clientId: "malformed-client" }));
+  socket.send(hello("malformed-client"));
   await waitForMessage(socket, (message) => message.type === "hello-ack");
   socket.send(JSON.stringify({
     type: "app-host-connect",
@@ -392,7 +409,7 @@ test("closes a relay and reports unsupported official app-host values", async (t
     if (message.type.startsWith("app-host-port-")) appHostEvents.push(message.type);
   });
   await waitForOpen(socket);
-  socket.send(JSON.stringify({ type: "hello", clientId: "encode-client" }));
+  socket.send(hello("encode-client"));
   await waitForMessage(socket, (message) => message.type === "hello-ack");
   socket.send(JSON.stringify({
     type: "app-host-connect",
@@ -458,7 +475,7 @@ test("does not close a replacement relay after an older relay encode failure", a
     if (message.type.startsWith("app-host-port-")) appHostEvents.push(message.type);
   });
   await waitForOpen(socket);
-  socket.send(JSON.stringify({ type: "hello", clientId: "replacement-client" }));
+  socket.send(hello("replacement-client"));
   await waitForMessage(socket, (message) => message.type === "hello-ack");
   const connect = {
     type: "app-host-connect",
@@ -537,7 +554,7 @@ test("isolates app-host relay failures by port and client", async (t) => {
     const socket = new WebSocket(`ws://127.0.0.1:${server.address().port}/ws`);
     sockets.push(socket);
     await waitForOpen(socket);
-    socket.send(JSON.stringify({ type: "hello", clientId }));
+    socket.send(hello(clientId));
     await waitForMessage(socket, (message) => message.type === "hello-ack");
     return socket;
   }

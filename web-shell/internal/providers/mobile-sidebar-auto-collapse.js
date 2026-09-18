@@ -114,6 +114,10 @@
     // 新版官方界面提供稳定标记；保留 view-transition 识别以兼容旧版。
     const markedButton = document.querySelector(SIDEBAR_TOGGLE_SELECTOR);
     if (markedButton?.matches?.("button") && visibleElement(markedButton)) return markedButton;
+    const markedFallback = markedButton?.matches?.("button") && markedButton.getBoundingClientRect?.().width > 0
+      ? markedButton
+      : null;
+    if (markedFallback) return markedFallback;
     return Array.from(document.querySelectorAll("button")).find((button) => {
       if (!visibleElement(button)) return false;
       return sidebarToggleViewTransitionName(button) === SIDEBAR_TOGGLE_VIEW_TRANSITION_NAME;
@@ -175,7 +179,17 @@
 
       let collapseTimer = null;
       const isEnabled = () => context.plugin.isEnabled();
-      const isMobile = () => !!context.platform.isMobile();
+      const isNarrowViewport = () => {
+        const width = Number(w.innerWidth || document.documentElement?.clientWidth || 0);
+        if (width > 0 && width <= 820) return true;
+        try {
+          return !!w.matchMedia?.("(pointer: coarse)")?.matches;
+        } catch {
+          return false;
+        }
+      };
+      // 同時支援真機能力同 Edge F12 窄屏模擬，確保兩種調試方式行為一致。
+      const isMobile = () => !!context.platform.isMobile() || isNarrowViewport();
 
       const collapseAfterSelection = () => {
         if (collapseTimer) scheduler.clearTimeout(collapseTimer);

@@ -26,10 +26,14 @@
   const OPENCODEX_LANGUAGES = [OPENCODEX_LOCALE, "zh-CN", "zh", "en-US", "en"];
   const AUTH_FORCE_LOGIN_STORAGE_KEY = "codex_web_force_login";
   const WS_READY_WAIT_TIMEOUT_MS = 2500;
+  // 連線斷開後只保留同一頁 session 五分鐘；超時後由頁面提示重新整理。
+  const GATEWAY_SESSION_TTL_MS = 5 * 60_000;
+  const CONNECTION_BANNER_DELAY_MS = 3000;
   const CLIENT_DIAGNOSTIC_FLUSH_DELAY_MS = 120;
   const CLIENT_DIAGNOSTIC_MAX_BATCH = 40;
   const LOW_PRIORITY_IPC_CONCURRENCY = 2;
   const LOW_PRIORITY_IPC_QUEUE_MAX_ENTRIES = 512;
+  const LOW_PRIORITY_IPC_QUEUE_TTL_MS = GATEWAY_SESSION_TTL_MS;
   const LOW_PRIORITY_IPC_LOG_EVERY = 25;
   const CONNECTOR_LOGO_CACHE_MAX_ENTRIES = 256;
   const CONNECTOR_LOGO_CACHE_MAX_CHARS = 8 * 1024 * 1024;
@@ -49,6 +53,7 @@
   const TERMINAL_QUEUE_MAX_SESSIONS = 64;
   const TERMINAL_QUEUE_MAX_PENDING_PER_SESSION = 512;
   const TERMINAL_QUEUE_MAX_TOTAL_PENDING = 4096;
+  const TERMINAL_QUEUE_TTL_MS = GATEWAY_SESSION_TTL_MS;
   const TERMINAL_SESSION_ID_MAX_CHARS = 256;
   const PLUGIN_IMAGE_PATH_MAX_CHARS = 8192;
   const SHARED_OBJECT_SNAPSHOT_MAX_ENTRIES = 512;
@@ -66,7 +71,15 @@
   const APP_HOST_PENDING_MESSAGE_CHARS_LIMIT = 16 * 1024 * 1024;
   const GATEWAY_AUTH_LOGOUT_LABEL = t("web.auth.logoutGateway");
   const GATEWAY_AUTH_LOGOUT_BUSY_LABEL = t("web.auth.logoutGatewayBusy");
-  const OFFICIAL_SETTINGS_LABELS = ["设置", "Settings"];
+  const OFFICIAL_LOGOUT_LABELS = [
+    "退出登录",
+    "Log out",
+    "Logout",
+    "Sign out",
+    "Sign Out",
+    "Sign out of Codex",
+    "Log out of Codex",
+  ];
   const MESSAGE_FOR_VIEW_CHANNEL = "codex_desktop:message-for-view";
   const WINDOW_FOCUS_CHANGED_MESSAGE = "electron-window-focus-changed";
 
@@ -157,7 +170,6 @@
   }
 
   const appHostProtocolChannel = adapterHost.protocol.channels.appHost;
-  const gatewayProtocolChannel = adapterHost.protocol.channels.gateway;
   adapterHost.protocol.observe({
     key: {},
     channel: appHostProtocolChannel,
@@ -170,38 +182,8 @@
   });
 
   function publishAppHostData(data, direction) {
-    // 转换先于观察和真实转发执行；修改点关闭后 Provider 会自动移除对应转换器。
-    const metadata = { direction, transport: "app-host" };
-    const transformed = adapterHost.protocol.process?.({
-      channel: appHostProtocolChannel,
-      value: data,
-      metadata,
-    }) ?? data;
-    adapterHost.protocol.publish({ channel: appHostProtocolChannel, value: transformed, metadata });
-    return transformed;
-  }
-
-  function publishGatewayData(channel, payload, direction, transport = "bridge") {
-    const metadata = { channel, direction, transport };
-    const envelope = { channel, payload };
-    const transformed = adapterHost.protocol.process?.({
-      channel: gatewayProtocolChannel,
-      value: envelope,
-      metadata,
-    }) ?? envelope;
-    const authoritative =
-      transformed &&
-      typeof transformed === "object" &&
-      transformed.channel === channel &&
-      Object.prototype.hasOwnProperty.call(transformed, "payload")
-        ? transformed
-        : envelope;
-    adapterHost.protocol.publish({
-      channel: gatewayProtocolChannel,
-      value: authoritative,
-      metadata,
-    });
-    return authoritative.payload;
+    // 同一帧只在 ProtocolPipeline 中解码一次，再分发给 Token 与智能调度消费者。
+    adapterHost.protocol.publish({ channel: appHostProtocolChannel, value: data, metadata: { direction } });
   }
 
   w.__OpenCodexSmartSchedulingBridgeDiagnostics = Object.freeze({
@@ -477,6 +459,11 @@
   let reconnectTimer = null;
   let reconnectDelay = 500;
   let reconnectDeferredUntilVisible = false;
+  let connectionState = "normal";
+  let connectionLostAtMs = 0;
+  let connectionBannerTimer = null;
+  let sessionExpiryTimer = null;
+  let clientErrorCaptureInstalled = false;
   const bridgeStartedAtMs = Date.now();
   const clientDiagnosticQueue = [];
   let clientDiagnosticFlushTimer = null;
@@ -602,6 +589,142 @@
       } else {
         scheduleClientDiagnosticFlush();
       }
+    } catch {}
+  }
+
+  function connectionBannerText(state) {
+    const chinese = /^zh/i.test(OPENCODEX_LOCALE);
+    if (state === "expired") {
+      return chinese ? "连接已失效，请刷新页面" : "Connection expired. Refresh the page.";
+    }
+    return chinese ? "连接已断开，正在重连…" : "Connection lost. Reconnecting…";
+  }
+
+  function renderConnectionBanner(state) {
+    if (!document || !document.body) return;
+    let banner = document.getElementById("codex-web-connection-banner");
+    if (state === "normal") {
+      banner?.remove();
+      return;
+    }
+    if (!banner) {
+      banner = document.createElement("div");
+      banner.id = "codex-web-connection-banner";
+      banner.setAttribute("role", "status");
+      banner.setAttribute("aria-live", "polite");
+      banner.style.cssText =
+        "position:fixed;top:12px;left:50%;transform:translateX(-50%);z-index:2147483000;max-width:calc(100vw - 24px);padding:8px 12px;border-radius:8px;background:rgba(48,48,48,.94);color:#fff;font:13px/1.4 system-ui,sans-serif;box-shadow:0 2px 12px rgba(0,0,0,.24);display:flex;align-items:center;gap:8px";
+      document.body.appendChild(banner);
+    }
+    banner.textContent = connectionBannerText(state);
+    if (state === "expired") {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.textContent = /^zh/i.test(OPENCODEX_LOCALE) ? "刷新" : "Refresh";
+      button.style.cssText = "border:0;border-radius:5px;padding:3px 8px;cursor:pointer";
+      button.addEventListener("click", () => w.location.reload());
+      banner.appendChild(button);
+    }
+  }
+
+  function clearConnectionTimers() {
+    if (connectionBannerTimer) scheduler.clearTimeout(connectionBannerTimer);
+    if (sessionExpiryTimer) scheduler.clearTimeout(sessionExpiryTimer);
+    connectionBannerTimer = null;
+    sessionExpiryTimer = null;
+  }
+
+  function setConnectionState(nextState, details = {}) {
+    if (nextState === connectionState && nextState !== "reconnecting") return;
+    const previousState = connectionState;
+    connectionState = nextState;
+    if (nextState === "normal") {
+      connectionLostAtMs = 0;
+      clearConnectionTimers();
+      renderConnectionBanner("normal");
+    } else if (nextState === "reconnecting") {
+      if (!connectionLostAtMs) connectionLostAtMs = Date.now();
+      if (!connectionBannerTimer) {
+        connectionBannerTimer = scheduler.setTimeout(() => {
+          connectionBannerTimer = null;
+          if (connectionState === "reconnecting") renderConnectionBanner("reconnecting");
+        }, CONNECTION_BANNER_DELAY_MS);
+      }
+      if (!sessionExpiryTimer) {
+        sessionExpiryTimer = scheduler.setTimeout(() => {
+          sessionExpiryTimer = null;
+          if (connectionState !== "reconnecting") return;
+          connectionState = "expired";
+          if (reconnectTimer) scheduler.clearTimeout(reconnectTimer);
+          reconnectTimer = null;
+          settleWsReadyWaiters(false);
+          rejectPendingGatewayIpc(Object.assign(new Error("Gateway session expired"), { code: "session_expired" }));
+          renderConnectionBanner("expired");
+          clientDiagnostic("gateway-session-expired", { ...details, ttlMs: GATEWAY_SESSION_TTL_MS });
+        }, GATEWAY_SESSION_TTL_MS);
+      }
+    } else if (nextState === "expired") {
+      clearConnectionTimers();
+      renderConnectionBanner("expired");
+    }
+    clientDiagnostic("connection-state", {
+      state: nextState,
+      previousState,
+      ...details,
+    });
+  }
+
+  function installClientErrorCapture() {
+    if (clientErrorCaptureInstalled) return;
+    clientErrorCaptureInstalled = true;
+    const report = (error, context = {}) => {
+      const normalized = error instanceof Error ? error : new Error(String(error || "Unknown client error"));
+      clientDiagnostic("client-uncaught-error", {
+        message: normalized.message,
+        errorName: normalized.name,
+        stack: normalized.stack || "",
+        route: `${location.pathname}${location.search}`,
+        userAgent: String(w.navigator?.userAgent || ""),
+        ...context,
+      });
+    };
+    adapterHost.events.observe({
+      key: {},
+      target: w,
+      type: "error",
+      capture: true,
+      callback(event) {
+        report(event?.error || event?.message, {
+          source: event?.filename || "",
+          line: event?.lineno || 0,
+          column: event?.colno || 0,
+        });
+      },
+    });
+    adapterHost.events.observe({
+      key: {},
+      target: w,
+      type: "unhandledrejection",
+      capture: true,
+      callback(event) {
+        report(event?.reason, { rejection: true });
+      },
+    });
+  }
+
+  function installElementFromPointGuard() {
+    const proto = w.Document?.prototype;
+    if (!proto || typeof proto.elementFromPoint !== "function" || proto.__codexFiniteElementFromPoint) return;
+    const original = proto.elementFromPoint;
+    try {
+      proto.elementFromPoint = function guardedElementFromPoint(x, y) {
+        if (!Number.isFinite(Number(x)) || !Number.isFinite(Number(y))) {
+          clientDiagnostic("element-from-point-invalid", { x: Number(x), y: Number(y) });
+          return null;
+        }
+        return original.call(this, x, y);
+      };
+      Object.defineProperty(proto, "__codexFiniteElementFromPoint", { value: true, configurable: true });
     } catch {}
   }
 
@@ -956,8 +1079,27 @@
   }
 
   function pumpLowPriorityIpcQueue() {
+    const expiryScheduler = typeof scheduler !== "undefined" && scheduler ? scheduler : globalThis;
+    const clearExpiryTimer = typeof expiryScheduler?.clearTimeout === "function"
+      ? expiryScheduler.clearTimeout.bind(expiryScheduler)
+      : () => {};
+    const setExpiryTimer = typeof expiryScheduler?.setTimeout === "function"
+      ? expiryScheduler.setTimeout.bind(expiryScheduler)
+      : () => 0;
+    const queueTtlMs = typeof LOW_PRIORITY_IPC_QUEUE_TTL_MS === "number" ? LOW_PRIORITY_IPC_QUEUE_TTL_MS : 5 * 60_000;
+    const now = Date.now();
+    while (lowPriorityIpcQueue.length > 0 && now - lowPriorityIpcQueue[0].enqueuedAtMs >= queueTtlMs) {
+      const expired = lowPriorityIpcQueue.shift();
+      expired.queued = false;
+      if (expired.expiryTimer) clearExpiryTimer(expired.expiryTimer);
+      const error = Object.assign(new Error("Low-priority IPC queue item expired"), { code: "queue_expired" });
+      expired.reject(error);
+      clientDiagnostic("queue-expired", { queueType: "low-priority-ipc", ...expired.summary });
+    }
     while (activeLowPriorityIpcCount < LOW_PRIORITY_IPC_CONCURRENCY && lowPriorityIpcQueue.length > 0) {
       const item = lowPriorityIpcQueue.shift();
+      item.queued = false;
+      if (item.expiryTimer) clearExpiryTimer(item.expiryTimer);
       activeLowPriorityIpcCount += 1;
       lowPriorityIpcStartedCount += 1;
       const waitMs = CLIENT_DIAGNOSTICS_ENABLED ? Date.now() - item.enqueuedAtMs : 0;
@@ -985,7 +1127,7 @@
 
   function enqueueLowPriorityIpc(summary, task) {
     lowPriorityIpcQueuedCount += 1;
-    const enqueuedAtMs = CLIENT_DIAGNOSTICS_ENABLED ? Date.now() : 0;
+    const enqueuedAtMs = Date.now();
     const queueDepth = lowPriorityIpcQueue.length + 1;
     if (CLIENT_DIAGNOSTICS_ENABLED && shouldLogLowPriorityIpcQueue(queueDepth, lowPriorityIpcQueuedCount)) {
       clientDiagnostic("ipc-low-priority-queued", {
@@ -1006,7 +1148,25 @@
       return Promise.reject(error);
     }
     return new Promise((resolve, reject) => {
-      lowPriorityIpcQueue.push({ enqueuedAtMs, reject, resolve, summary, task });
+      const item = { enqueuedAtMs, expiryTimer: null, queued: true, reject, resolve, summary, task };
+      const queueTtlMs = typeof LOW_PRIORITY_IPC_QUEUE_TTL_MS === "number" ? LOW_PRIORITY_IPC_QUEUE_TTL_MS : 5 * 60_000;
+      const expiryScheduler = typeof scheduler !== "undefined" && scheduler ? scheduler : globalThis;
+      const setExpiryTimer = typeof expiryScheduler?.setTimeout === "function"
+        ? expiryScheduler.setTimeout.bind(expiryScheduler)
+        : () => 0;
+      // 队列没有新任务进入时，单靠 pump 无法清理过期项；每项独立 timer 确保断线后不会永久占内存。
+      item.expiryTimer = setExpiryTimer(() => {
+        if (!item.queued) return;
+        const index = lowPriorityIpcQueue.indexOf(item);
+        if (index < 0) return;
+        lowPriorityIpcQueue.splice(index, 1);
+        item.queued = false;
+        const error = Object.assign(new Error("Low-priority IPC queue item expired"), { code: "queue_expired" });
+        item.reject(error);
+        clientDiagnostic("queue-expired", { queueType: "low-priority-ipc", ...item.summary });
+        pumpLowPriorityIpcQueue();
+      }, queueTtlMs);
+      lowPriorityIpcQueue.push(item);
       pumpLowPriorityIpcQueue();
     });
   }
@@ -1044,10 +1204,10 @@
     ).trim();
   }
 
-  function officialSettingsLabelFromElement(element) {
+  function officialLogoutLabelFromElement(element) {
     const label = elementTextLabel(element).replace(/\s+/g, " ").trim();
     if (!label || label === GATEWAY_AUTH_LOGOUT_LABEL) return "";
-    return OFFICIAL_SETTINGS_LABELS.find((text) => label === text || label.startsWith(`${text}…`) || label.startsWith(`${text}...`) || label.startsWith(`${text} `) || label.startsWith(`${text}⌘`)) || "";
+    return OFFICIAL_LOGOUT_LABELS.find((text) => label === text || label.includes(text)) || "";
   }
 
   function isMenuLikeContext(element) {
@@ -1064,11 +1224,11 @@
     return false;
   }
 
-  function isOfficialSettingsMenuItem(element) {
+  function isOfficialLogoutMenuItem(element) {
     if (!element || element.nodeType !== 1) return false;
     if (element.dataset?.codexWebGatewayAuthLogout === "true") return false;
     if (!visibleElement(element)) return false;
-    if (!officialSettingsLabelFromElement(element)) return false;
+    if (!officialLogoutLabelFromElement(element)) return false;
     if (!isMenuLikeContext(element)) return false;
     const tagName = String(element.tagName || "").toLowerCase();
     const role = String(element.getAttribute?.("role") || "").toLowerCase();
@@ -1161,14 +1321,10 @@
     logoutGatewayAuthFromMenu(item);
   }
 
-  function createGatewayAuthLogoutMenuItem(settingsItem) {
+  function createGatewayAuthLogoutMenuItem(logoutItem) {
     modificationEffects?.gatewayAuthMenu?.emit();
-    const officialLabel = officialSettingsLabelFromElement(settingsItem) || "设置";
-    const item = settingsItem.cloneNode(true);
-    // 复用设置项的样式，但移除它的跳转目标及快捷键提示。
-    item.removeAttribute("href");
-    item.removeAttribute("aria-keyshortcuts");
-    item.querySelectorAll("kbd").forEach((node) => node.remove());
+    const officialLabel = officialLogoutLabelFromElement(logoutItem) || "退出登录";
+    const item = logoutItem.cloneNode(true);
     item.dataset.codexWebGatewayAuthLogout = "true";
     item.dataset.codexWebGatewayAuthOriginalLabel = GATEWAY_AUTH_LOGOUT_LABEL;
     item.setAttribute("aria-label", GATEWAY_AUTH_LOGOUT_LABEL);
@@ -1194,24 +1350,23 @@
     return item;
   }
 
-  function injectGatewayAuthLogoutMenuItem(settingsItem) {
-    const parent = settingsItem && settingsItem.parentElement;
+  function injectGatewayAuthLogoutMenuItem(logoutItem) {
+    const parent = logoutItem && logoutItem.parentElement;
     if (!parent) return false;
     if (Array.from(parent.children || []).some((child) => child.dataset?.codexWebGatewayAuthLogout === "true")) {
       return false;
     }
-    // 设置在账号和 API 登录菜单中均可用，退出认证紧随其后。
-    parent.insertBefore(createGatewayAuthLogoutMenuItem(settingsItem), settingsItem.nextSibling);
+    parent.insertBefore(createGatewayAuthLogoutMenuItem(logoutItem), logoutItem);
     return true;
   }
 
   function scanGatewayAuthLogoutMenuItems(root = document) {
     const scope = root && root.nodeType === 1 ? root : document;
     const candidates = Array.from(scope.querySelectorAll?.("button,a,[role='menuitem'],[role='menuitemradio']") || []);
-    if (scope !== document && isOfficialSettingsMenuItem(scope)) candidates.unshift(scope);
+    if (scope !== document && isOfficialLogoutMenuItem(scope)) candidates.unshift(scope);
     let injected = 0;
     for (const candidate of candidates) {
-      if (isOfficialSettingsMenuItem(candidate) && injectGatewayAuthLogoutMenuItem(candidate)) injected += 1;
+      if (isOfficialLogoutMenuItem(candidate) && injectGatewayAuthLogoutMenuItem(candidate)) injected += 1;
     }
     return injected;
   }
@@ -1423,9 +1578,8 @@
 
   /** Web 适配模块生成的官方入站消息需要同时覆盖 bridge 订阅和 window message 两种消费方式。 */
   function deliverLocalRendererMessage(channel, payload) {
-    const authoritativePayload = publishGatewayData(channel, payload, "server", "local");
-    const delivered = dispatch(channel, authoritativePayload);
-    emitWindowMessage(channel, authoritativePayload);
+    const delivered = dispatch(channel, payload);
+    emitWindowMessage(channel, payload);
     return delivered;
   }
 
@@ -1830,7 +1984,8 @@
 
   /** 发送 fetch-response 给官方 vscode-api 请求管理器。 */
   function emitFetchResponse(payload) {
-    deliverLocalRendererMessage("fetch-response", payload);
+    dispatch("fetch-response", payload);
+    emitWindowMessage("fetch-response", payload);
   }
 
   /** 成功响应 vscode://codex/... fetch IPC，bodyJsonString 必须是 JSON 字符串。 */
@@ -1941,6 +2096,8 @@
     } catch {}
     const stableId = typeof request.stable_id === "string" ? request.stable_id : "";
     const user = {
+      // 本地默认 Statsig 用户补齐 userID，避免每个 gate/config 都重复打印缺少 ID 的预期警告。
+      userID: stableId || shortClientId(clientId) || "opencodex-web",
       ...(typeof request.locale === "string" ? { locale: request.locale } : {}),
       ...(typeof request.app_version === "string" ? { appVersion: request.app_version } : {}),
       ...(stableId
@@ -2410,7 +2567,7 @@
       closeAppHostRelay(state, "decode_failed", true);
       return true;
     }
-    data = publishAppHostData(data, "server");
+    publishAppHostData(data, "server");
     try {
       state.port.postMessage(data);
       if (data === null) closeAppHostRelay(state, "official_closed", false);
@@ -2464,8 +2621,7 @@
       port.addEventListener("message", (portEvent) => {
         if (state.closed || state.closing) return;
         // MessageEvent.data 可能不是自有属性，直接读取才能拿到新版结构化 RPC 值。
-        const originalPortData = portEvent ? portEvent.data : undefined;
-        const portData = publishAppHostData(originalPortData, "client");
+        const portData = portEvent ? portEvent.data : undefined;
         let wireData;
         try {
           wireData = encodeAppHostMessageData(portData);
@@ -2478,9 +2634,11 @@
           closeAppHostRelay(state, "encode_failed", true);
           return;
         }
+        // 当前官方 Web 路由固定为根路径；展示模块需从本标签页发出的 RPC 识别正在查看的 thread。
+        publishAppHostData(portData, "client");
         queueAppHostRelayPayload(state, { type: "app-host-port-message", ...wireData });
         // 保留旧版 null 关闭语义；新版 renderer 的 undefined 终止帧编码后也只发送一次。
-        if (originalPortData === null || originalPortData === undefined) closeAppHostRelay(state, "browser_closed", false);
+        if (portData === null || portData === undefined) closeAppHostRelay(state, "browser_closed", false);
       });
       port.addEventListener("messageerror", () => {
         clientDiagnostic("app-host-browser-message-error", { portId: state.portId });
@@ -2783,10 +2941,34 @@
     const previous = terminalMessageQueues.get(normalizedSessionId) || Promise.resolve();
     terminalMessageQueueDepths.set(normalizedSessionId, sessionPendingCount + 1);
     terminalMessagePendingCount += 1;
+    let expired = false;
+    const expiryScheduler = typeof scheduler !== "undefined" && scheduler ? scheduler : globalThis;
+    const setExpiryTimer = typeof expiryScheduler?.setTimeout === "function" ? expiryScheduler.setTimeout.bind(expiryScheduler) : () => 0;
+    const clearExpiryTimer = typeof expiryScheduler?.clearTimeout === "function" ? expiryScheduler.clearTimeout.bind(expiryScheduler) : () => {};
+    const terminalTtlMs = typeof TERMINAL_QUEUE_TTL_MS === "number" ? TERMINAL_QUEUE_TTL_MS : 5 * 60_000;
+    let rejectExpiry;
+    const expiryPromise = new Promise((_, reject) => {
+      rejectExpiry = reject;
+    });
+    const expiryTimer = setExpiryTimer(() => {
+      expired = true;
+      const error = Object.assign(new Error("Terminal queue item expired"), { code: "queue_expired" });
+      clientDiagnostic("queue-expired", {
+        queueType: "terminal",
+        sessionId: shortClientId(normalizedSessionId),
+        messageType: payload && typeof payload === "object" ? payload.type : "",
+      });
+      // 立即结束调用方 promise；后续链仍会检查 expired，避免超时项真正发送到 gateway。
+      rejectExpiry(error);
+    }, terminalTtlMs);
     const next = previous
       .catch(() => {})
-      .then(() => invoke("codex_desktop:message-from-view", payload))
+      .then(() => {
+        if (expired) throw Object.assign(new Error("Terminal queue item expired"), { code: "queue_expired" });
+        return invoke("codex_desktop:message-from-view", payload);
+      })
       .finally(() => {
+        clearExpiryTimer(expiryTimer);
         terminalMessagePendingCount = Math.max(0, terminalMessagePendingCount - 1);
         const remaining = Math.max(0, (terminalMessageQueueDepths.get(normalizedSessionId) || 1) - 1);
         if (remaining > 0) terminalMessageQueueDepths.set(normalizedSessionId, remaining);
@@ -2796,7 +2978,7 @@
         }
       });
     terminalMessageQueues.set(normalizedSessionId, next);
-    return next;
+    return Promise.race([next, expiryPromise]);
   }
 
   /** terminal-write 也走队列，避免输入字符和 attach/resize 交错。 */
@@ -2866,6 +3048,8 @@
 
   /** 把 Desktop 专用 app://fs/@fs/... URL 转成 gateway 同源文件 URL。 */
   function appFsUrlToGatewayUrl(value) {
+    const earlyRewritten = w.__opencodexAppFsUrlToGatewayUrl?.(value);
+    if (earlyRewritten) return earlyRewritten;
     if (typeof value !== "string" || !value.startsWith("app://fs/")) return null;
     try {
       const url = new URL(value);
@@ -2882,15 +3066,18 @@
     }
   }
 
-  /** 重写单个图片节点的 app://fs src，避免浏览器直接请求不支持的自定义协议。 */
+  /** 重写官方资源节点的 app://fs URL，避免浏览器直接请求不支持的自定义协议。 */
   function rewriteAppFsImageElement(element) {
-    if (!element || element.nodeType !== 1 || String(element.tagName || "").toLowerCase() !== "img") return;
-    const rawSrc = element.getAttribute("src") || element.src || "";
+    if (!element || element.nodeType !== 1) return;
+    const tagName = String(element.tagName || "").toLowerCase();
+    if (!["img", "source", "link"].includes(tagName)) return;
+    const attribute = tagName === "link" ? "href" : "src";
+    const rawSrc = element.getAttribute(attribute) || element[attribute] || "";
     const rewritten = appFsUrlToGatewayUrl(rawSrc);
-    if (!rewritten || element.getAttribute("src") === rewritten) return;
+    if (!rewritten || element.getAttribute(attribute) === rewritten) return;
     modificationEffects?.appFsImage?.emit();
     element.setAttribute("data-codex-web-app-fs-src", rawSrc);
-    element.setAttribute("src", rewritten);
+    element.setAttribute(attribute, rewritten);
   }
 
   /** 图片以预设 src 插入时不会产生属性 mutation，由资源错误捕获补做协议改写。 */
@@ -2906,7 +3093,7 @@
 
     const scanExistingImages = () => {
       document
-        .querySelectorAll?.("img[src^='app://fs/']")
+        .querySelectorAll?.("img[src^='app://fs/'],source[src^='app://fs/'],link[href^='app://fs/']")
         .forEach((element) => rewriteAppFsImageElement(element));
     };
 
@@ -2923,7 +3110,7 @@
       disposeObservation = adapterHost.dom.observe({
         key: {},
         root: document.documentElement,
-        options: { attributes: true, attributeFilter: ["src"], subtree: true },
+        options: { attributes: true, attributeFilter: ["src", "href"], subtree: true },
         callback(mutations) {
           for (const mutation of mutations) rewriteAppFsImageElement(mutation.target);
         },
@@ -2985,17 +3172,12 @@
 
   const sharedObjectSnapshot = new Map();
   const persistedAtomSnapshot = new Map();
-  const PENDING_WORKTREES_KEY = "pending_worktrees";
   const COMPOSER_PERMISSION_MODE_VISIBILITY_KEY = "composer-permission-mode-visibility";
   const DEFAULT_COMPOSER_PERMISSION_MODE_VISIBILITY = {
     "guardian-approvals": true,
     "full-access": true,
   };
-  const PINNED_SHARED_OBJECT_SNAPSHOT_KEYS = new Set([
-    "host_config",
-    STATSIG_DEFAULT_FEATURES_CONFIG,
-    PENDING_WORKTREES_KEY,
-  ]);
+  const PINNED_SHARED_OBJECT_SNAPSHOT_KEYS = new Set(["host_config", STATSIG_DEFAULT_FEATURES_CONFIG]);
   const PINNED_PERSISTED_ATOM_SNAPSHOT_KEYS = new Set([
     "prompt-history",
     COMPOSER_PERMISSION_MODE_VISIBILITY_KEY,
@@ -3020,10 +3202,8 @@
     return value !== null && typeof value === "object" && !Array.isArray(value);
   }
 
-  /** shared-object snapshot 写入前补齐 Web 必需的已知形态。 */
+  /** shared-object snapshot 写入前补齐 Web 必需 feature flag。 */
   function normalizeSharedObjectSnapshotValue(key, value) {
-    // 官方 pending_worktrees 消费者只接受数组或 undefined；Web 首屏缺值不能以 null 注入其状态机。
-    if (key === PENDING_WORKTREES_KEY) return Array.isArray(value) ? value : undefined;
     if (key !== STATSIG_DEFAULT_FEATURES_CONFIG) return value;
     return {
       ...(isPlainObject(value) ? value : {}),
@@ -3037,23 +3217,20 @@
     const normalized = normalizeSharedObjectSnapshotValue(key, value);
     // 重写已有键时刷新 LRU 顺序，避免活跃状态被一次性的扩展键挤出。
     sharedObjectSnapshot.delete(key);
-    // 对齐官方 preload：undefined 表示尚无快照，不能作为一个已加载值留在 Map 中。
-    if (key === PENDING_WORKTREES_KEY && normalized === undefined) return undefined;
     sharedObjectSnapshot.set(key, normalized);
     trimSnapshotMap(sharedObjectSnapshot, SHARED_OBJECT_SNAPSHOT_MAX_ENTRIES, PINNED_SHARED_OBJECT_SNAPSHOT_KEYS);
     return normalized;
   }
 
-  /** 记录官方 shared-object 回包，并按各已知 key 的消费约定规范化值。 */
+  /** 记录官方 shared-object 回包，并保留官方值本身的 true/false/缺省语义。 */
   function cacheSharedObjectUpdatedPayload(payload) {
     if (!isPlainObject(payload) || !payload.key) return payload;
     const value = setSharedObjectSnapshotValue(payload.key, payload.value);
     return value === payload.value ? payload : { ...payload, value };
   }
 
-  /** 读取 shared-object snapshot：Statsig 懒补默认值，pending_worktrees 保留官方缺失语义。 */
+  /** 读取 shared-object snapshot，特定 key 会懒补默认值。 */
   function getSharedObjectSnapshotValue(key) {
-    if (key === PENDING_WORKTREES_KEY && !sharedObjectSnapshot.has(key)) return undefined;
     if (key === STATSIG_DEFAULT_FEATURES_CONFIG || sharedObjectSnapshot.has(key)) {
       return setSharedObjectSnapshotValue(key, sharedObjectSnapshot.get(key));
     }
@@ -3215,11 +3392,6 @@
     target.startFileDrag = () => false;
     target.sendMessageFromView = async (payload) =>
       Promise.resolve().then(() => {
-        const protocolChannel =
-          payload && typeof payload === "object" && typeof payload.type === "string"
-            ? payload.type
-            : "view:message";
-        payload = publishGatewayData(protocolChannel, payload, "client");
         if (payload && typeof payload === "object" && payload.type === "persisted-atom-sync-request") {
           modificationEffects?.persistedAtom?.emit();
           // 官方 renderer 首屏会很早请求 persisted atom；这里先本地回包，避免 WS 未连接导致回包丢失。
@@ -3428,6 +3600,25 @@
     };
   }
 
+  function installStatsigWarningFilter() {
+    if (w.__codexStatsigWarningFilterInstalled || !w.console?.warn) return;
+    const originalWarn = w.console.warn.bind(w.console);
+    w.console.warn = (...args) => {
+      const text = args.map((value) => String(value)).join(" ");
+      if (/\[Statsig\].*required id_type ["']userID["']/i.test(text)) {
+        clientDiagnostic("statsig-warning-suppressed", { warning: text });
+        return;
+      }
+      // 根路由本身是官方 layout 的空 Outlet；唔係功能錯誤，但 React Router 會重複刷同一條 warning。
+      if (/Matched leaf route at location "\/" does not have an element or Component\./i.test(text)) {
+        clientDiagnostic("route-empty-warning-suppressed", { warning: text, route: location.pathname });
+        return;
+      }
+      originalWarn(...args);
+    };
+    w.__codexStatsigWarningFilterInstalled = true;
+  }
+
   function isStatsigInitializeUrl(url) {
     try {
       const parsed = new URL(url, location.href);
@@ -3572,6 +3763,7 @@
       ws = socket;
     } catch (error) {
       console.warn("[codex-web] failed to open gateway socket", error);
+      setConnectionState("reconnecting", { error: error instanceof Error ? error.message : String(error) });
       clientDiagnostic("ws-connect-failed", {
         error: error instanceof Error ? error.message : String(error),
         errorName: error && error.name ? String(error.name) : "",
@@ -3598,7 +3790,7 @@
       // hello 会把本页面 clientId 注册到 gateway，后续审批/fetch 响应才能定向回来。
       reconnectDelay = 500;
       try {
-        socket.send(JSON.stringify({ type: "hello", clientId }));
+        socket.send(JSON.stringify({ type: "hello", clientId, gatewayInstanceId: cfg.gatewayInstanceId || "" }));
         clientDiagnostic("ws-hello-sent", {
           wsReady,
           wsState: websocketStateName(socket),
@@ -3627,9 +3819,24 @@
         // 官方桥接协议要求浏览器收到完整 JSON 后再按 channel/MessagePort 分发，不能在这里改消息形状。
         msg = JSON.parse(rawData);
         parseMs = WS_DEBUG_ENABLED ? Date.now() - parseStartedAtMs : 0;
+        if (msg && msg.type === "gateway-session-expired") {
+          setConnectionState("expired", { reason: "gateway_instance_changed" });
+          try {
+            socket.close(4001, "gateway-session-expired");
+          } catch {}
+          return;
+        }
         if (msg && msg.type === "hello-ack" && msg.clientId === clientId) {
+          if (!cfg.gatewayInstanceId || msg.gatewayInstanceId !== cfg.gatewayInstanceId) {
+            setConnectionState("expired", { reason: "gateway_instance_changed" });
+            try {
+              socket.close(4001, "gateway-session-expired");
+            } catch {}
+            return;
+          }
           // ack 表示 gateway 已经把 clientId 写入路由表，之后再发 IPC 才不会丢首批异步回包。
           markGatewayWsReady();
+          setConnectionState("normal", { wsState: websocketStateName(socket) });
           clientDiagnostic("ws-hello-ack", {
             ready: true,
             wsReady,
@@ -3738,11 +3945,9 @@
             effectiveChannel === "shared-object-updated"
               ? cacheSharedObjectUpdatedPayload(messagePayload)
               : messagePayload;
-          const rendererMessagePayload = publishGatewayData(
+          const rendererMessagePayload = browserRendererMessagePayload(
             effectiveChannel,
-            browserRendererMessagePayload(effectiveChannel, authoritativeMessagePayload),
-            "server",
-            "gateway-ws"
+            authoritativeMessagePayload
           );
           if (shouldDispatchGatewayMessage(msg.channel, effectiveChannel)) {
             dispatch(effectiveChannel, rendererMessagePayload);
@@ -3776,6 +3981,10 @@
         // MessagePort 属于页面而不是 WS；保留它，并在下一次 hello-ack 后重新接到官方 listener。
         for (const state of appHostPortRelays.values()) state.connected = false;
       }
+      setConnectionState("reconnecting", {
+        status: event && typeof event.code === "number" ? event.code : 0,
+        wsState: websocketStateName(socket),
+      });
       clientDiagnostic("ws-close", {
         status: event && typeof event.code === "number" ? event.code : 0,
         wsReady,
@@ -3786,6 +3995,7 @@
       scheduleReconnect();
     });
     socket.addEventListener("error", (event) => {
+      setConnectionState("reconnecting", { wsState: websocketStateName(socket), errorName: event?.type || "error" });
       clientDiagnostic("ws-error", {
         errorName: event && event.type ? String(event.type) : "",
         wsReady,
@@ -3799,6 +4009,7 @@
 
   /** WebSocket 断开后的指数退避重连。 */
   function scheduleReconnect() {
+    if (connectionState === "expired") return;
     if (reconnectTimer) return;
     if (document.visibilityState === "hidden") {
       reconnectDeferredUntilVisible = true;
@@ -3827,6 +4038,16 @@
     if (reconnectDeferredUntilVisible || !ws || ws.readyState === w.WebSocket.CLOSED) scheduleReconnect();
   }
 
+  function handlePageLifecycle(event) {
+    // pagehide.persisted=true 即將入 BFCache；通知 gateway 保留官方 AppHost
+    // MessagePort，否則頁面恢復後舊 RPC export ID 會變孤兒，之後不停報錯。
+    const persisted = event && event.persisted === true;
+    sendGatewayControlPayload(
+      { type: "opencodex:page-lifecycle", lifecycle: "pagehide", persisted },
+      "page-lifecycle-send-failed"
+    );
+  }
+
   modificationScope?.own?.(() => {
     settleWsReadyWaiters(false);
     rejectPendingGatewayIpc(new Error("Renderer page was replaced"));
@@ -3844,9 +4065,14 @@
     terminalMessageQueues.clear();
     terminalMessageQueueDepths.clear();
     terminalMessagePendingCount = 0;
+    clearConnectionTimers();
   });
 
   // 已连接 socket 保持后台业务语义；只有断线重试暂停，回到前台后再按原退避策略恢复。
   adapterHost.events.observe({ key: {}, target: document, type: "visibilitychange", callback: handleReconnectVisibilityChange });
+  adapterHost.events.observe({ key: {}, target: document, type: "pagehide", callback: handlePageLifecycle });
+  installClientErrorCapture();
+  installElementFromPointGuard();
+  installStatsigWarningFilter();
   connect();
 })();

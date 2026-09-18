@@ -15,7 +15,6 @@ const {
   markLatestReleaseChecking,
 } = require("./latest-release.cjs");
 const { createBoundedLogWriter } = require("./log-writer.cjs");
-const { openPwaOrBrowser } = require("./pwa-launcher.cjs");
 const { OPENCODEX_VERSION_LABEL } = require("../shared/app-version.cjs");
 const { PREFERRED_LANGUAGES_ENV, formatMessage, resolveOpenCodexI18n } = require("../shared/i18n/index.cjs");
 const {
@@ -51,8 +50,6 @@ let latestReleaseCheckedForForeground = false;
 let isQuitting = false;
 let gatewayStartPromise = null;
 let gatewayRestartPromise = null;
-let skipNextOfficialScan = false;
-let restoringBackup = false;
 const gatewayLogWriter = createBoundedLogWriter();
 
 const gatewayState = {
@@ -579,17 +576,6 @@ async function ensurePortSetting(paths, settings) {
   });
 }
 
-function officialBundleCache() {
-  const { OfficialBundleCache } = require("../gateway/dist/official/OfficialBundleCache.js");
-  const { OfficialBundleFileSystem } = require("../gateway/dist/official/OfficialBundleFileSystem.js");
-  return new OfficialBundleCache({
-    projectRoot: APP_ROOT,
-    configuredBundleDir: runtimePaths().officialBundleDir,
-    fileSystem: new OfficialBundleFileSystem(),
-    logger: { warn: (message) => appendLog(`[launcher] ${message}\n`) },
-  });
-}
-
 function buildState() {
   const i18n = currentGatewayI18n();
   const latestRelease = gatewayState.latestRelease || {};
@@ -634,7 +620,6 @@ function buildState() {
     lastError: gatewayState.lastError,
     startedAt: gatewayState.startedAt,
     officialRuntime: gatewayState.officialRuntime,
-    bundleBackup: { ...officialBundleCache().backupState(), restoring: restoringBackup },
     locale: i18n.locale,
     messages: i18n.messages,
     i18nSource: i18n.source,
@@ -679,7 +664,7 @@ function checkLatestReleaseForForeground() {
 }
 
 function openOpenCodexUrl() {
-  // launcher 打开本机 PWA 或浏览器时固定使用 localhost；展示和复制仍走 primaryUrl 方便局域网访问。
+  // 只有 launcher 主动打开浏览器时固定使用 localhost；展示和复制仍走 primaryUrl 方便局域网访问。
   return gatewayState.port ? `http://localhost:${gatewayState.port}` : "";
 }
 
@@ -687,22 +672,9 @@ function canOpenOpenCodex() {
   return !!gatewayState.child && !gatewayState.child.killed && !!openOpenCodexUrl();
 }
 
-let openOpenCodexPromise = null;
-
-async function openOpenCodex() {
+function openOpenCodex() {
   const openUrl = openOpenCodexUrl();
-  if (!canOpenOpenCodex()) return buildState();
-  // 按钮和托盘共用一次检测，连续点击不会重复拉起应用窗口。
-  if (!openOpenCodexPromise) {
-    openOpenCodexPromise = openPwaOrBrowser(openUrl, {
-      shell,
-      desktopPath: app.getPath("desktop"),
-      log: (message) => appendLog(`[launcher] ${message}\n`),
-    }).catch((error) => {
-      appendLog(`[launcher] open OpenCodex failed: ${error.message}\n`, { urgent: true });
-    }).finally(() => { openOpenCodexPromise = null; });
-  }
-  await openOpenCodexPromise;
+  if (canOpenOpenCodex()) shell.openExternal(openUrl);
   return buildState();
 }
 
@@ -740,8 +712,10 @@ function broadcastState() {
 
 async function fetchGatewayStatus({ signal } = {}) {
   if (!gatewayState.localUrl) return null;
-  // 前台刷新和定时探活共用公开健康接口，保留完整诊断结果供界面展示。
-  const response = await fetch(`${gatewayState.localUrl}/api/health`, {
+  const response = await fetch(`${gatewayState.localUrl}/api/launcher/status`, {
+    headers: {
+      "x-opencodex-launcher-token": gatewayState.token,
+    },
     ...(signal ? { signal } : {}),
   });
   if (!response.ok) {
@@ -779,8 +753,6 @@ function refreshGatewayStatus() {
     } catch (error) {
       // 窗口隐藏时主动中止的请求不代表 gateway 故障，不能把 AbortError 展示成服务错误。
       if (error?.name === "AbortError" && (!timedOut || !launcherWindowNeedsStatusPolling())) return;
-      // 请求失败后清除旧快照，避免继续展示上一次健康结果。
-      gatewayState.status = null;
       if (error?.name === "AbortError" && timedOut) {
         // 单次探活必须有上限，否则一个挂起 fetch 会让 single-flight 永久阻塞后续状态更新。
         gatewayState.lastError = `gateway status timed out after ${GATEWAY_STATUS_TIMEOUT_MS}ms`;
@@ -824,16 +796,13 @@ function startStatusPolling() {
 async function startGatewayOnce() {
   if (gatewayState.child) return buildState();
 
-  // 一次性覆盖只用于本轮启动环境，不写入用户设置。
-  const skipOfficialScan = skipNextOfficialScan;
-  skipNextOfficialScan = false;
   const paths = runtimePaths();
   gatewayState.paths = paths;
   ensureRuntimeLayout(paths);
   gatewayState.settings = await ensurePortSetting(paths, loadLauncherSettings(paths));
   applyPreventSleepSetting(gatewayState.settings);
   gatewayState.host = hostForMode(gatewayState.settings.hostMode);
-  const officialAutoScanUpgrade = !skipOfficialScan && normalizeOfficialAutoScanUpgrade(gatewayState.settings.officialAutoScanUpgrade);
+  const officialAutoScanUpgrade = normalizeOfficialAutoScanUpgrade(gatewayState.settings.officialAutoScanUpgrade);
 
   if (!fs.existsSync(paths.gatewayScriptPath)) {
     gatewayState.lastError = `Missing gateway entry: ${paths.gatewayScriptPath}`;
@@ -1024,7 +993,7 @@ function stopGateway() {
   });
 }
 
-async function restartGatewayOnce(beforeStart) {
+async function restartGatewayOnce() {
   // runtime 尚在准备时先等本轮启动落地，再按正常停止流程重启，避免设置变更被旧启动吞掉。
   if (gatewayStartPromise) {
     try {
@@ -1038,7 +1007,6 @@ async function restartGatewayOnce(beforeStart) {
     broadcastState();
     return buildState();
   }
-  if (beforeStart) beforeStart();
   return startGateway();
 }
 
@@ -1051,38 +1019,6 @@ async function restartGateway() {
   } finally {
     gatewayRestartPromise = null;
   }
-}
-
-async function restoreBundleBackup() {
-  // 与所有服务重启共用互斥状态，避免停止期间另一次重启先占用目录。
-  if (gatewayRestartPromise) return gatewayRestartPromise;
-  restoringBackup = true;
-  gatewayRestartPromise = (async () => {
-    try {
-      const cache = officialBundleCache();
-      const backup = cache.backupState();
-      if (!backup.available) throw new Error(`无法还原备份：${backup.reason}`);
-      broadcastState();
-      return await restartGatewayOnce(() => {
-        cache.restoreBackup();
-        skipNextOfficialScan = true;
-        gatewayState.status = null;
-        appendLog("[launcher] 已还原 bundle 备份，本次启动临时跳过更新扫描\n");
-      });
-    } catch (error) {
-      gatewayState.lastError = errorLogText(error);
-      appendLog(`[launcher] ${gatewayState.lastError}\n`, { urgent: true });
-      return buildState();
-    }
-  })();
-  try {
-    await gatewayRestartPromise;
-  } finally {
-    restoringBackup = false;
-    gatewayRestartPromise = null;
-    broadcastState();
-  }
-  return buildState();
 }
 
 function createWindow() {
@@ -1273,15 +1209,10 @@ function revealPath(targetPath) {
 }
 
 ipcMain.handle("launcher:get-state", () => buildState());
-ipcMain.handle("launcher:start", () => gatewayRestartPromise || startGateway());
+ipcMain.handle("launcher:start", () => startGateway());
 ipcMain.handle("launcher:restart", () => restartGateway());
-ipcMain.handle("launcher:restore-bundle-backup", () => restoreBundleBackup());
 ipcMain.handle("launcher:open-url", () => {
   return openOpenCodex();
-});
-ipcMain.handle("launcher:open-health", () => {
-  // 地址由主进程生成，不接受渲染进程提供任意外链。
-  if (gatewayState.localUrl) return shell.openExternal(`${gatewayState.localUrl}/api/health`);
 });
 ipcMain.handle("launcher:open-logs", async () => {
   await flushGatewayLog();

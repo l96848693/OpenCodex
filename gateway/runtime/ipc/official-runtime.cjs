@@ -10,6 +10,7 @@ const {
   AUTH_CONFIG_PATH,
   CODEX_HOME,
   DEBUG_LOGS,
+  GATEWAY_INSTANCE_ID,
   HOST,
   MESSAGE_FOR_VIEW_CHANNEL,
   MESSAGE_FROM_VIEW_CHANNEL,
@@ -62,6 +63,7 @@ let wsHub = null;
 let appServerChildDecorator = null;
 let runtimeCompatibility = null;
 let removeWsClientReadyListener = null;
+let mobileLivePublisher = null;
 // 官方 runtime 会把自身 TMPDIR 改到隔离目录；observer 必须在此之前记住原始 fallback socket。
 const ORIGINAL_SYSTEM_TMPDIR = os.tmpdir();
 
@@ -84,6 +86,16 @@ const officialLiveObserver = createOfficialLiveObserver({
     if (wsHub) wsHub.broadcast(payload, { suppressDiagnostic: true });
     // peer snapshot 也会改变 recent-conversations-meta；沿用官方 renderer 的 invalidation 协议。
     scheduleThreadListEventSync(payload.channel, [payload.payload]);
+  },
+  publishMobile(event) {
+    // Mobile 只接收已收窄嘅流式狀態／增量；原始官方快照仍只留喺 desktop Web bridge。
+    try {
+      mobileLivePublisher?.(event);
+    } catch (error) {
+      diagnosticWarn("official-live-observer", "mobile_event_publish_failed", {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
   },
   onError(error) {
     diagnosticWarn("official-live-observer", "observer_error", {
@@ -532,10 +544,10 @@ function recordHiddenAppServerRedirect(launcher, command, normalizedArgs, replac
   });
 }
 
-function decorateHiddenAppServerChild(child) {
+function decorateHiddenAppServerChild(child, restartFactory = null) {
   if (typeof appServerChildDecorator !== "function") return child;
   try {
-    const decorated = appServerChildDecorator(child) || child;
+    const decorated = appServerChildDecorator(child, restartFactory) || child;
     appServerSpawnHook.decoratedCount += 1;
     appServerSpawnHook.decoratorError = null;
     return decorated;
@@ -552,7 +564,11 @@ function redirectHiddenAppServerSpawn(originalSpawn, bundle, self, command, args
   const normalizedArgs = spawnArgList(args);
   if (looksLikeOfficialCodexBinary(command, bundle, spawnOptions) && isHiddenOfficialAppServerArgs(normalizedArgs)) {
     recordHiddenAppServerRedirect("spawn", command, normalizedArgs, bundle.codexBinaryPath);
-    return decorateHiddenAppServerChild(originalSpawn.call(self, bundle.codexBinaryPath, normalizedArgs, spawnOptions));
+    const spawnAgain = () => decorateHiddenAppServerChild(
+      originalSpawn.call(self, bundle.codexBinaryPath, normalizedArgs, spawnOptions),
+      spawnAgain
+    );
+    return spawnAgain();
   }
   const fileManagerPath = fileManagerPathFromSpawn(command, normalizedArgs);
   if (fileManagerPath && maybeInterceptRemoteFileManagerOpen(fileManagerPath)) {
@@ -567,9 +583,11 @@ function redirectHiddenAppServerExecFile(originalExecFile, bundle, self, command
   if (looksLikeOfficialCodexBinary(command, bundle, execOptions) && isHiddenOfficialAppServerArgs(normalizedArgs)) {
     const execCallback = execFileCallbackFromArgs(args, options, callback);
     recordHiddenAppServerRedirect("execFile", command, normalizedArgs, bundle.codexBinaryPath);
-    return decorateHiddenAppServerChild(
-      originalExecFile.call(self, bundle.codexBinaryPath, normalizedArgs, execOptions, execCallback)
+    const execAgain = () => decorateHiddenAppServerChild(
+      originalExecFile.call(self, bundle.codexBinaryPath, normalizedArgs, execOptions, execCallback),
+      execAgain
     );
+    return execAgain();
   }
   if (looksLikeComputerUseInstaller(command)) {
     recordRuntimeCompatibilityHit(gatewayPointRefs.computerUseInstaller);
@@ -672,6 +690,14 @@ function setWsHub(nextWsHub) {
     typeof nextWsHub?.onClientReady === "function"
       ? nextWsHub.onClientReady(() => officialLiveObserver.refresh())
       : null;
+}
+
+function setMobileLivePublisher(publisher) {
+  mobileLivePublisher = typeof publisher === "function" ? publisher : null;
+}
+
+function observeOfficialThread(threadId, hostId = "local") {
+  return officialLiveObserver.observeThread(threadId, hostId);
 }
 
 function getOfficialBundle() {
@@ -931,8 +957,19 @@ function isOfficialHiddenWebContents(webContents) {
   return sameWebContents(webContents, officialIpc.hiddenWebContents);
 }
 
+function isLikelyOfficialPrimaryWindow(win) {
+  // 官方 primary 係唯一要求至少 480x600 嘅視窗；輔助視窗尺寸更細，唔可以搶走主橋接。
+  if (!win) return false;
+  const options = win.__opencodexBrowserWindowOptions;
+  if (!options || typeof options !== "object") return false;
+  return Number(options.minWidth) >= 480 && Number(options.minHeight) >= 600;
+}
+
 function shouldBridgeOfficialWebContents(webContents, primaryWebContents) {
   if (!webContents) return false;
+  // 只可以喺現有 primary 已經銷毀時揀新窗口。單靠尺寸標記唔足以分辨
+  // 官方嘅 auxiliary/overlay 窗口；錯誤接管會令官方 AppHost whenReady() 收到
+  // "Primary renderer was replaced"，直接令瀏覽器頁面進入錯誤邊界。
   if (!primaryWebContents || primaryWebContents.isDestroyed?.()) return true;
   return sameWebContents(webContents, primaryWebContents);
 }
@@ -1843,6 +1880,23 @@ function routeOfficialWebContentsSend(
    * gateway 需要把这些 webContents.send 拦下来，并转换成浏览器 WebSocket 消息。
    */
   recordRuntimeCompatibilityHit(gatewayPointRefs.webContentsSend);
+  // primary 被官方替換後，舊 renderer 仍可能完成非同步回調；拒絕舊來源，避免將過期
+  // AppHost/IPC frame 投遞到瀏覽器，觸發官方 "Primary renderer was replaced"。
+  if (
+    officialIpc.hiddenWebContents &&
+    sourceWebContents &&
+    !sameWebContents(sourceWebContents, officialIpc.hiddenWebContents)
+  ) {
+    if (DEBUG_LOGS) {
+      diagnosticWarn("official-ipc-route", "stale_renderer_suppressed", {
+        sourceWebContentsId: typeof sourceWebContents.id === "number" ? sourceWebContents.id : null,
+        currentWebContentsId:
+          typeof officialIpc.hiddenWebContents.id === "number" ? officialIpc.hiddenWebContents.id : null,
+        channel,
+      });
+    }
+    return false;
+  }
   let routedArgs = args;
   let payload = payloadFromArgs(routedArgs);
   if (channel === MESSAGE_FOR_VIEW_CHANNEL) {
@@ -2066,6 +2120,11 @@ function installBrowserWindowHooks() {
       x: -32000,
       y: -32000,
     });
+    // 保存原始視窗參數，供生命週期切換時區分 primary 同輔助視窗。
+    win.__opencodexBrowserWindowOptions = { ...options };
+    try {
+      win.webContents.__opencodexOfficialPrimary = isLikelyOfficialPrimaryWindow(win);
+    } catch {}
     recordRuntimeCompatibilityHit(gatewayPointRefs.browserWindow);
     registerOfficialWindow(win);
     return win;
@@ -2352,87 +2411,12 @@ function buildGatewayStatus() {
   const localUrl = `http://127.0.0.1:${PORT}`;
   let compatibility = null;
   try {
-    const snapshot = runtimeCompatibility?.snapshot?.();
-    if (snapshot) {
-      // 整点停用与部分贡献停用分别处理，避免一个 disabled 掩盖其他贡献失败。
-      const pointStatuses = [];
-      const abnormalPoints = snapshot.points.flatMap((point) => {
-        if (point.explicitlyDisabled) {
-          pointStatuses.push("disabled");
-          return [];
-        }
-        const phases = point.contributions.length
-          ? point.contributions.map((item) => ({
-              contributionId: item.id,
-              location: { status: item.location, reason: item.reason },
-              application: { status: item.application, lastError: item.reason },
-              verification: { status: item.verification, lastError: item.reason },
-              activation: { status: item.activation, lastError: item.reason },
-              fallback: { active: item.fallbackActive, reason: item.fallbackReason },
-              exercise: { status: item.exercise },
-            }))
-          : [point];
-        const issues = [];
-        let pending = false;
-        let enabledCount = 0;
-        let unavailable = false;
-        let degraded = false;
-        let exercised = true;
-        for (const phase of phases) {
-          if (phase.application.status === "disabled") continue;
-          enabledCount += 1;
-          exercised = exercised && phase.exercise.status === "active";
-          const issueStart = issues.length;
-          const add = (type, reason) => issues.push({ type, reason, ...(phase.contributionId ? { contributionId: phase.contributionId } : {}) });
-          if (phase.location.status === "unsupported") add("unsupported", phase.location.reason);
-          if (["ambiguous", "failed", "stale"].includes(phase.location.status)) add("location", phase.location.reason);
-          if (phase.application.status === "failed") add("application", phase.application.lastError);
-          if (phase.verification.status === "failed") add("verification", phase.verification.lastError);
-          if (phase.activation.status === "failed") add("activation", phase.activation.lastError);
-          if (phase.fallback.active && issues.length === issueStart) add("fallback", phase.fallback.reason);
-          degraded = degraded || phase.fallback.active;
-          unavailable = unavailable || (issues.length > issueStart && !phase.fallback.active);
-          // 待检查按修改点去重，只统计仍启用且没有明确失败的贡献。
-          if (issues.length === issueStart && (
-            ["unresolved", "resolving"].includes(phase.location.status) ||
-            ["pending", "applying"].includes(phase.application.status) ||
-            phase.verification.status === "pending" ||
-            (phase.contributionId && ["inactive", "activating", "disposed"].includes(phase.activation.status))
-          )) pending = true;
-        }
-        // 每个修改点只归入一种状态；无备用实现的失败优先于降级和待检查。
-        pointStatuses.push(!enabledCount ? "disabled" : unavailable ? "unavailable" : degraded ? "degraded" : pending ? "pending" : exercised ? "healthy" : "ready");
-        return issues.length ? [{ id: point.id, description: point.description, issues }] : [];
-      });
-      const countStatus = (status) => pointStatuses.filter((value) => value === status).length;
-      const unavailableCount = countStatus("unavailable");
-      const degradedCount = countStatus("degraded");
-      const pendingCount = countStatus("pending");
-      // 主动禁用不降低健康程度；总体状态和数量使用同一份贡献检查结果。
-      const status = unavailableCount ? "unavailable"
-        : degradedCount ? "degraded"
-        : pendingCount ? "pending"
-        : countStatus("ready") ? "ready"
-        : pointStatuses.length && countStatus("disabled") === pointStatuses.length ? "disabled"
-        : "healthy";
-      compatibility = {
-        status,
-        generatedAt: snapshot.generatedAt,
-        pointCount: snapshot.points.length,
-        unavailableCount,
-        degradedCount,
-        pendingCount,
-        abnormalCount: abnormalPoints.length,
-        abnormalPoints,
-        // 浏览器认证前尚未上报属于待检查，保留状态与数量，但仅明确异常影响健康结果。
-        ok: abnormalPoints.length === 0,
-      };
-    }
+    compatibility = runtimeCompatibility?.summary?.() || null;
   } catch {
     // 诊断汇总失败不能让 Launcher 探活接口失效。
   }
-  const status = {
-    ok: false,
+  return {
+    ok: true,
     gateway: {
       kind: "official",
       host: HOST,
@@ -2465,18 +2449,6 @@ function buildGatewayStatus() {
     i18n: getI18nSnapshot(),
     workspaceRoots: workspaceRootsFromEnv(),
   };
-  // 配置与计数不是健康指标；汇总必需组件的就绪、安装及明确错误状态。
-  status.checks = {
-    officialBundle: !!status.officialBundle,
-    officialIpc: status.officialIpc.ready === true,
-    compatibility: compatibility?.ok === true,
-  };
-  for (const name of ["officialAppServer", "officialElectronModule", "officialNotification", "officialTray"]) {
-    const component = status[name];
-    status.checks[name] = component.installed === true && !component.lastError && !component.decoratorError;
-  }
-  status.ok = Object.values(status.checks).every((value) => value === true);
-  return status;
 }
 
 async function webConfigScript(options = {}) {
@@ -2491,6 +2463,7 @@ async function webConfigScript(options = {}) {
   window.__CODEX_WEB_CONFIG__ = {
     gatewayBaseUrl: location.origin,
     gatewayWsUrl: location.origin.replace(/^http/, "ws") + "/ws",
+    gatewayInstanceId: ${JSON.stringify(GATEWAY_INSTANCE_ID)},
     workspaceRoots: ${JSON.stringify(workspaceRootsFromEnv())},
     homeDir: ${JSON.stringify(os.homedir())},
     locale: ${JSON.stringify(i18n.locale)},
@@ -2654,7 +2627,9 @@ module.exports = {
   listOfficialIpcChannels,
   rejectPendingInternalResponses,
   requestContext,
+  observeOfficialThread,
   setWsHub,
+  setMobileLivePublisher,
   startOfficialRuntime,
   webConfigScript,
   __test: {

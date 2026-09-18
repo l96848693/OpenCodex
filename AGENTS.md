@@ -1,45 +1,33 @@
-# AGENTS.md
+# 項目開發規範 (Project Guidelines)
 
-## Code Comment Requirements
+本文件定義咗本項目嘅代碼開發、版本控制同 AI 交互規範。所有開發者（包括 AI Agents）必須嚴格遵守。
 
-- 每次写代码时，都必须根据实际逻辑添加适当的中文注释，以提高代码可读性，帮助阅读者快速理清实现思路。
+## 1. 語言與溝通規範 (Language Policy)
+遵循同级目录`COMMON.md`
 
-## Commit Requirements
+## 3. 項目結構與工具 (Project Structure & Tools)
+遵循同级目录`COMMON.md`
 
-Follow the existing commit style in this repository.
+## 4. 測試規範 (Testing)
+遵循同级目录`COMMON.md`
 
-Use Conventional Commit-style messages:
+## 5. 瀏覽器自動化與 MCP (Browser & MCP)
+*基於 AGENTS.md 強制約束*
 
-```text
-<type>[(scope)]: <summary>
-```
+- **Edge 瀏覽器路由**：
+  - 瀏覽、測試或調試網頁時，**必須**先讀取並遵循 `$edge-browser-router` Skill。
+  - **嚴禁**繞過 Skill 直接將 `edge-browser-mcp` 當作默認入口。
+  - MCP 僅作為 Skill 按需啟動嘅 `profile` 或 `extension` 後端。
+- **執行流程**：
+  - 用戶未指定軌道時，依次嘗試：官方 Edge 集成 -> 專用 Profile -> Playwright Extension。
+  - 任務結束後，**必須**清理本次自動化資源。
 
-Rules:
+## 6. 開發規範
+遵循同级目录`COMMON.md`
 
-- Use English commit messages.
-- Keep the subject to one concise line.
-- Use a lowercase type.
-- Include a lowercase scope when the change belongs to a recognizable module or subsystem.
-- Omit the scope only for genuinely repository-wide or cross-cutting changes where no single scope is accurate.
-- Reuse an established scope instead of introducing a synonym. Common scopes include `compatibility`, `gateway`, `launcher`, `plugin`, `polyfill`, `router`, `test`, `web`, and `web-shell`.
-- Use `compatibility` for the runtime compatibility kernel, diagnostics service, and diagnostics interface.
-- Do not end the subject with a period.
-- Keep each commit focused on one logical change.
+## 7. BUG模版
+遵循同级目录`COMMON.md`
 
-Common types used in this repo:
+## 8.研發文檔
+遵循同级目录`COMMON.md`
 
-- `feat`: user-facing feature or new capability.
-- `fix`: bug fix or behavior correction.
-- `chore`: tooling, dependencies, build setup, or maintenance.
-- `doc`: documentation-only changes.
-
-Examples from the existing history:
-
-```text
-feat: load gateway password from config
-fix(compatibility): clarify runtime contribution titles
-fix(polyfill): collapse sidebar on new chat
-fix(terminal): restore web terminal sessions
-chore: switch package manager to pnpm
-doc: update README
-```

@@ -1,9 +1,11 @@
 const crypto = require("crypto");
 const fs = require("fs");
+const os = require("os");
 const path = require("path");
 const { pipeline } = require("stream/promises");
 const {
   CODEX_GENERATED_IMAGES_DIR,
+  CODEX_HOME,
   CODEX_WEB_PICKED_FILES_DIR,
   LOCAL_DOWNLOAD_ARCHIVE_DIR,
   LOCAL_DOWNLOAD_ARCHIVE_MAX_BYTES,
@@ -48,11 +50,26 @@ function appFsPathFromRequestPath(pathname) {
   if (!pathname.startsWith(prefix)) return null;
   try {
     const decoded = decodeURIComponent(pathname.slice(prefix.length));
-    const filePath = path.normalize(`/${decoded}`);
+    // Windows 盘符路径本身已经是绝对路径，唔可以再强行加 `/`，否则会变成 `\\C:\\...`。
+    const filePath = path.normalize(path.isAbsolute(decoded) ? decoded : `/${decoded}`);
     return path.isAbsolute(filePath) ? filePath : null;
   } catch {
     return null;
   }
+}
+
+/** 集中列出 app://fs 固定白名單，方便安全審計同回歸測試。 */
+function appFsAllowedRoots(extraWorkspaceRoots = []) {
+  return [
+    CODEX_GENERATED_IMAGES_DIR,
+    CODEX_WEB_PICKED_FILES_DIR,
+    // 官方插件圖標會由 app://fs 指向用戶快取；只開放固定嘅 Codex 插件快取根目錄。
+    path.join(os.homedir(), ".cache", "codex-runtimes"),
+    path.join(CODEX_HOME, ".tmp", "plugins"),
+    path.join(CODEX_HOME, ".tmp", "bundled-marketplaces"),
+    ...workspaceRootsFromEnv(),
+    ...extraWorkspaceRoots,
+  ];
 }
 
 /** app://fs 只服务 Codex 生成图、Web 附件临时目录和当前允许的 workspace roots。 */
@@ -63,12 +80,7 @@ function isAllowedAppFsFile(filePath, extraWorkspaceRoots = []) {
    * - Web 上传/选择文件临时目录。
    * - launcher 注入的 workspace roots。
    */
-  const roots = [
-    CODEX_GENERATED_IMAGES_DIR,
-    CODEX_WEB_PICKED_FILES_DIR,
-    ...workspaceRootsFromEnv(),
-    ...extraWorkspaceRoots,
-  ];
+  const roots = appFsAllowedRoots(extraWorkspaceRoots);
   return roots.some((root) => typeof root === "string" && root.length > 0 && isWithinRoot(filePath, root));
 }
 
@@ -435,9 +447,11 @@ function createLocalFileService(options = {}) {
 }
 
 module.exports = {
+  appFsAllowedRoots,
   createLocalFileService,
   isAllowedAppFsFile,
   isAllowedLocalDownloadPath,
+  appFsPathFromRequestPath,
   pluginImagePathFromUrl,
   safeInlineFilename,
 };

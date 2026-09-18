@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 const fs = require("fs");
+const http = require("http");
 const path = require("path");
 const { spawn } = require("child_process");
 const { prepareOfficialElectronRuntime } = require("../runner/index.cjs");
@@ -34,6 +35,50 @@ function ensureDir(dirPath) {
 
 function logLauncher(line) {
   process.stdout.write(line);
+}
+
+function probeHost(host) {
+  // 通配地址唔可以用嚟主動連接，開發探針統一走本機迴環地址。
+  return host === "0.0.0.0" || host === "::" || host === "[::]" ? "127.0.0.1" : host;
+}
+
+function probeExistingGateway({ host, port }) {
+  return new Promise((resolve) => {
+    const request = http.get(
+      {
+        host: probeHost(host),
+        port,
+        path: "/api/health",
+        headers: { accept: "application/json" },
+      },
+      (response) => {
+        let body = "";
+        response.setEncoding("utf8");
+        response.on("data", (chunk) => {
+          body += chunk;
+          if (body.length > 256 * 1024) response.destroy();
+        });
+        response.on("end", () => {
+          if (response.statusCode !== 200) return resolve(null);
+          try {
+            resolve(JSON.parse(body));
+          } catch {
+            resolve(null);
+          }
+        });
+        response.on("error", () => resolve(null));
+      }
+    );
+    request.setTimeout(700, () => request.destroy());
+    request.on("error", () => resolve(null));
+  });
+}
+
+function samePath(left, right) {
+  if (typeof left !== "string" || !left.trim()) return false;
+  const normalize = (value) => path.normalize(path.resolve(String(value || "")));
+  if (process.platform === "win32") return normalize(left).toLowerCase() === normalize(right).toLowerCase();
+  return normalize(left) === normalize(right);
 }
 
 let activeChild = null;
@@ -100,6 +145,22 @@ async function main() {
   ensureDir(reportsDir);
   ensureDir(officialBundleDir);
   ensureDir(officialUserDataDir);
+
+  const configuredPort = Number(process.env.PORT || 3737);
+  const configuredHost = process.env.HOST || "0.0.0.0";
+  const existingGateway = await probeExistingGateway({ host: configuredHost, port: configuredPort });
+  if (
+    existingGateway?.gateway?.kind === "official" &&
+    Number(existingGateway.gateway.port) === configuredPort &&
+    samePath(existingGateway.gateway.projectRoot, APP_ROOT)
+  ) {
+    const url = existingGateway.gateway.localUrl || `http://127.0.0.1:${configuredPort}`;
+    logLauncher(
+      `[launcher] OpenCodex Gateway 已经运行中：${url} (PID ${existingGateway.gateway.pid || "unknown"})\n` +
+        "[launcher] 已复用现有服务；如需重启，请回到原本运行 Gateway 的终端按 Ctrl+C，再重新执行启动命令。\n"
+    );
+    return;
+  }
 
   // 命令行开发入口也必须走官方 Electron runner，避免和 launcher 路径出现两套 ABI 行为。
   const officialRuntime = await prepareOfficialElectronRuntime({

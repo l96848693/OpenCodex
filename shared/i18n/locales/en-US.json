@@ -1,5 +1,4 @@
 {
-  "launcher.codex.restoreBackup": "Restore previous version",
   "common.unknown": "Unknown",
   "common.notFound": "Not found",
   "common.notCreated": "Not created",
@@ -14,7 +13,6 @@
   "common.status": "Status",
   "launcher.status.ready": "Ready",
   "launcher.status.gatewayStarted": "Gateway started",
-  "launcher.status.healthWarning": "Health warning",
   "launcher.status.starting": "Starting",
   "launcher.status.stopped": "Stopped",
   "launcher.hero.urlLabel": "Access URL",
@@ -104,7 +102,7 @@
   "web.settings.notificationTestBody": "Future official notifications will be shown by this browser.",
   "web.settings.notificationUnsupported": "Not supported by this browser",
   "web.settings.developerDiagnostics": "Developer diagnostics",
-  "web.settings.runtimeCompatibility": "Runtime compatibility",
+  "web.settings.runtimeCompatibility": "Official runtime compatibility",
   "web.settings.runtimeCompatibilityDescription": "Inspect modification-point location, application, verification, and hit status",
   "web.settings.about": "About",
   "web.settings.star": "Star OpenCodex on GitHub",

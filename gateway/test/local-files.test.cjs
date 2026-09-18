@@ -6,8 +6,8 @@ const path = require("node:path");
 const { Writable } = require("node:stream");
 const test = require("node:test");
 const zlib = require("node:zlib");
-const { LOCAL_DOWNLOAD_ARCHIVE_MAX_BYTES, LOCAL_DOWNLOAD_ARCHIVE_MAX_FILES } = require("../runtime/core/config.cjs");
-const { createLocalFileService } = require("../runtime/http/local-files.cjs");
+const { CODEX_HOME, LOCAL_DOWNLOAD_ARCHIVE_MAX_BYTES, LOCAL_DOWNLOAD_ARCHIVE_MAX_FILES } = require("../runtime/core/config.cjs");
+const { appFsAllowedRoots, appFsPathFromRequestPath, createLocalFileService, isAllowedAppFsFile } = require("../runtime/http/local-files.cjs");
 
 function makeTempFile(t, fileName, content) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "opencodex-local-file-test-"));
@@ -56,6 +56,20 @@ async function waitForResponseBody(response) {
 function pathnameFromLocalFileUrl(url) {
   return new URL(url, "http://opencodex.local").pathname;
 }
+
+test("preserves Windows drive letters when resolving app-fs paths", () => {
+  const drivePath = process.platform === "win32" ? "C:/Users/young/.cache/codex-runtimes/icon.png" : "/tmp/opencodex/icon.png";
+  const encoded = drivePath.replaceAll("/", "/").split("/").map((part, index) => index === 0 ? part : encodeURIComponent(part)).join("/");
+  const resolved = appFsPathFromRequestPath(`/api/app-fs/@fs/${encoded}`);
+  assert.equal(resolved, process.platform === "win32" ? "C:\\Users\\young\\.cache\\codex-runtimes\\icon.png" : "/tmp/opencodex/icon.png");
+});
+
+test("allows only the fixed Codex plugin cache roots for app-fs plugin images", () => {
+  const roots = appFsAllowedRoots();
+  assert.equal(roots.includes(path.join(CODEX_HOME, ".tmp", "plugins")), true);
+  assert.equal(roots.includes(path.join(CODEX_HOME, ".tmp", "bundled-marketplaces")), true);
+  assert.equal(roots.includes(path.join(CODEX_HOME, "private")), false);
+});
 
 function localZipEntries(zipBuffer) {
   const entries = new Map();

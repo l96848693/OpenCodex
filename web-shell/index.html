@@ -15,6 +15,7 @@
     <!-- 浏览器首屏使用 192px 图标，避免为页签图标下载 1024px 原始素材。 -->
     <link rel="icon" type="image/png" sizes="192x192" href="/assets/pwa-icon-192.png" />
     <link rel="apple-touch-icon" href="/assets/pwa-icon-192.png" />
+    <link id="codex-web-window-controls-overlay-styles" rel="stylesheet" href="/codex-window-controls-overlay.css" />
     <title>OpenCodex</title>
     <!-- codex-official-styles -->
     <!-- opencodex-runtime-config -->
@@ -554,7 +555,7 @@
           <!-- 兼容性快照已经脱敏且只读，因此入口在认证前的设置侧栏中也可以直接使用。 -->
           <a class="settings-row settings-link-row" href="/settings/developer/runtime-compatibility">
             <span class="settings-row-content">
-              <span class="settings-row-title" data-i18n="web.settings.runtimeCompatibility">运行时兼容性</span>
+              <span class="settings-row-title" data-i18n="web.settings.runtimeCompatibility">官方运行时兼容性</span>
               <span class="settings-row-description" data-i18n="web.settings.runtimeCompatibilityDescription">查看修改点的定位、应用、验证、激活和命中状态</span>
             </span>
             <span class="settings-row-trailing" aria-hidden="true">›</span>
@@ -1186,6 +1187,7 @@
           }
           clearForceLogin();
           if (body.token) storeToken(body.token);
+          return body.token || "";
         }
 
         form.addEventListener("submit", async (event) => {
@@ -1193,9 +1195,19 @@
           errorBox.textContent = "";
           submit.disabled = true;
           try {
-            await login(passwordInput.value);
+            const token = await login(passwordInput.value);
             passwordInput.value = "";
             await gatewayPluginSwitches?.sync();
+            if (token) {
+              // 移动端对 document.open/write 重解析支持唔稳定；用一次性 query token 导航，
+              // 由 gateway 换成 HttpOnly cookie 后立即清理 URL，避免 Android 浏览器白屏。
+              const nextUrl = new URL(window.location.href);
+              nextUrl.search = "";
+              nextUrl.hash = "";
+              nextUrl.searchParams.set("token", token);
+              window.location.replace(nextUrl.toString());
+              return;
+            }
             await bootRenderer();
           } catch (error) {
             showLogin(localizedError(error));

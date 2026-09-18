@@ -70,11 +70,15 @@
       const offsetTop = Math.max(0, Number(viewport?.offsetTop || 0));
       const layoutHeight = Math.max(0, Number(root.clientHeight || w.innerHeight || visualHeight));
       const innerHeight = Math.max(0, Number(w.innerHeight || layoutHeight || visualHeight));
+      const screenHeight = Math.max(0, Number(w.screen?.height || 0));
+      const screenAvailableHeight = Math.max(0, Number(w.screen?.availHeight || 0));
       return Object.freeze({
         bodyHeight: Math.max(0, Number(document.body?.clientHeight || 0)),
         innerHeight,
         layoutHeight,
         offsetTop,
+        screenAvailableHeight,
+        screenHeight,
         visualBottom: visualHeight + offsetTop,
         visualHeight,
       });
@@ -234,6 +238,34 @@
   }
   const viewportCoordinator = w.__OpenCodexViewportCoordinator;
 
+  function viewportInsets(snapshot, keyboardFocused, stableVisualHeight = 0) {
+    const DEFAULT_ANDROID_BROWSER_CHROME_INSET = 64;
+    const visualBottom = Math.max(0, Number(snapshot?.visualBottom || 0));
+    const innerHeight = Math.max(0, Number(snapshot?.innerHeight || 0));
+    const layoutGap = Math.max(0, innerHeight - visualBottom);
+    const screenHeight = Math.max(0, Number(snapshot?.screenHeight || 0));
+    const availableHeight = Math.max(0, Number(snapshot?.screenAvailableHeight || 0));
+    const systemUiInset = availableHeight > 0 ? Math.max(0, screenHeight - availableHeight) : 0;
+    const screenGap = screenHeight > 0 ? Math.max(0, screenHeight - visualBottom - systemUiInset) : 0;
+    const focusedHeightDrop = keyboardFocused
+      ? Math.max(0, Number(stableVisualHeight || 0) - Math.max(0, Number(snapshot?.visualHeight || 0)))
+      : 0;
+    // Android 键盘通常令可视区缩短超过 120px；浏览器工具栏则应是较小、稳定的差值。
+    // Chromium 有时令 innerHeight 同 visualViewport 一齐缩细，layoutGap 会保持 0；
+    // 需要同未聚焦时稳定高度比较，先唔会把键盘误当成浏览器底栏再留一层空白。
+    const keyboardVisible = layoutGap >= 120 || (keyboardFocused && (layoutGap >= 80 || focusedHeightDrop >= 80));
+    const browserChromeInset = keyboardVisible
+      ? 0
+      : Math.min(160, screenGap || layoutGap || DEFAULT_ANDROID_BROWSER_CHROME_INSET);
+    return Object.freeze({
+      browserChromeInset: Math.max(0, Math.floor(browserChromeInset)),
+      keyboardInset: Math.max(0, Math.floor(Math.max(layoutGap, focusedHeightDrop))),
+      keyboardVisible,
+    });
+  }
+  // 仅暴露无敏感数据的几何诊断，方便隔离浏览器回归测试核对底栏/键盘判定。
+  w.__OpenCodexMobileViewportMetrics = Object.freeze({ viewportInsets });
+
   registerPlugin({
     id: "opencodex.mobile-keyboard-optimization",
     name: "Mobile keyboard optimization",
@@ -246,24 +278,34 @@
     builtin: true,
     order: 10,
     activate(context) {
+      const narrowViewport = () => {
+        const width = Number(w.innerWidth || document.documentElement?.clientWidth || 0);
+        if (width > 0 && width <= 820) return true;
+        try {
+          return !!w.matchMedia?.("(pointer: coarse)")?.matches;
+        } catch {
+          return false;
+        }
+      };
       if (
         context.scope !== "renderer" ||
         !document ||
-        !context.platform.isMobile() ||
         document.__opencodexMobileKeyboardPluginInstalled ||
         !adapterHost?.events?.observe ||
         !adapterHost?.hooks?.around
       ) {
-        // 桌面端没有软键盘，不安装 viewport/input 监听器，也不写入仅移动端消费的 CSS 变量。
+        // 先安装轻量视口监听；桌面端缩到 F12 手机宽度后，插件才可以即时切换到移动排版。
         return null;
       }
       document.__opencodexMobileKeyboardPluginInstalled = true;
 
       let focusBlockedUntilMs = 0;
       let lastManualFocusIntentAtMs = 0;
+      let stableUnfocusedVisualHeight = 0;
 
       const isEnabled = () => context.plugin.isEnabled();
-      const isMobile = () => !!context.platform.isMobile();
+      // 桌面瀏覽器縮到手機寬度時都要套用移動版排版，方便調試亦同真機一致。
+      const isMobile = () => !!context.platform.isMobile() || narrowViewport();
 
       const setDatasetValue = (root, key, value) => {
         if (root.dataset[key] !== value) root.dataset[key] = value;
@@ -300,11 +342,91 @@
             scroll-margin-bottom: calc(var(--codex-keyboard-inset-bottom, 0px) + 96px);
           }
 
+          html[data-opencodex-mobile-keyboard-optimization="true"]:not([data-opencodex-ios-keyboard-optimization="true"]) [data-app-shell-main-content-layout],
+          html[data-opencodex-mobile-keyboard-optimization="true"]:not([data-opencodex-ios-keyboard-optimization="true"]) .app-shell-main-content-viewport {
+            /* Android 浏览器底栏不属于 layout viewport；把测得的安全区交给 floating footer。 */
+            --thread-floating-content-bottom-inset: calc(var(--spacing, 4px) * 3 + var(--codex-browser-chrome-inset-bottom, 0px));
+            min-width: 0 !important;
+            width: 100% !important;
+          }
+
+          html[data-opencodex-mobile-keyboard-optimization="true"][data-opencodex-android-keyboard-visible="true"]:not([data-opencodex-ios-keyboard-optimization="true"]) [data-app-shell-main-content-layout],
+          html[data-opencodex-mobile-keyboard-optimization="true"][data-opencodex-android-keyboard-visible="true"]:not([data-opencodex-ios-keyboard-optimization="true"]) .app-shell-main-content-viewport {
+            /* 鍵盤令 visual viewport 收縮時，footer 避让键盘，增加足够间距避免输入框被遮挡。 */
+            --thread-floating-content-bottom-inset: calc(var(--spacing, 4px) * 6) !important;
+          }
+
+          html[data-opencodex-mobile-keyboard-optimization="true"]:not([data-opencodex-android-keyboard-visible="true"]):not([data-opencodex-ios-keyboard-optimization="true"]) [data-app-shell-main-content-layout],
+          html[data-opencodex-mobile-keyboard-optimization="true"]:not([data-opencodex-android-keyboard-visible="true"]):not([data-opencodex-ios-keyboard-optimization="true"]) .app-shell-main-content-viewport {
+            /* 鍵盤關閉時，避免浏覽器底栏遮挡对话框，增加更多預留空間。 */
+            --thread-floating-content-bottom-inset: calc(var(--spacing, 4px) * 6 + 60px) !important;
+          }
+
+          html[data-opencodex-mobile-keyboard-optimization="true"][data-opencodex-android-keyboard-visible="true"] [data-thread-scroll-footer="true"] {
+            margin-bottom: 0 !important;
+            padding-bottom: 0 !important;
+          }
+
+          html[data-opencodex-mobile-keyboard-optimization="true"]:not([data-opencodex-ios-keyboard-optimization="true"]) main[data-app-shell-main-surface],
+          html[data-opencodex-mobile-keyboard-optimization="true"]:not([data-opencodex-ios-keyboard-optimization="true"]) [data-app-shell-workspace-layout],
+          html[data-opencodex-mobile-keyboard-optimization="true"]:not([data-opencodex-ios-keyboard-optimization="true"]) .app-shell-main-content-frame {
+            box-sizing: border-box !important;
+            min-width: 0 !important;
+            width: 100% !important;
+            overflow-x: hidden !important;
+          }
+
+          html[data-opencodex-mobile-keyboard-optimization="true"] header[data-app-shell-header-edge-scroll] {
+            box-sizing: border-box !important;
+            min-width: 0 !important;
+            max-width: 100% !important;
+            overflow-x: auto !important;
+            overflow-y: hidden !important;
+          }
+
+          html[data-opencodex-mobile-keyboard-optimization="true"] .app-shell-left-panel {
+            /* 窄屏左右欄用 overlay，唔可以再壓縮主會話區。 */
+            background: var(--surface-primary, #fff) !important;
+          }
+
+          /* 官方部分版本會將 sidebar trigger 標成 hidden；窄屏下仍要保留可操作入口。 */
+          html[data-opencodex-mobile-keyboard-optimization="true"] button[data-app-shell-sidebar-trigger] {
+            visibility: visible !important;
+            opacity: 1 !important;
+            pointer-events: auto !important;
+          }
+
+          html[data-opencodex-mobile-keyboard-optimization="true"] .app-shell-left-panel[data-opencodex-mobile-left-panel-overlay="true"] {
+            box-sizing: border-box !important;
+            width: min(88vw, 320px) !important;
+            max-width: 88vw !important;
+            min-width: 0 !important;
+            position: fixed !important;
+            inset-block: 0 !important;
+            inset-inline-start: 0 !important;
+            z-index: 40 !important;
+            overflow-y: auto !important;
+            overflow-x: hidden !important;
+          }
+
+          html[data-opencodex-mobile-keyboard-optimization="true"] [data-opencodex-mobile-right-panel-overlay="true"] {
+            /* 移動端右欄用 overlay，唔參與主內容 flex 寬度。右欄 z-index 提高避免同左欄重疊。 */
+            position: fixed !important;
+            inset-block: 0 !important;
+            inset-inline-end: 0 !important;
+            width: min(88vw, 420px) !important;
+            max-width: 88vw !important;
+            z-index: 40 !important;
+            overflow-y: auto !important;
+            overflow-x: hidden !important;
+          }
+
           html[data-opencodex-ios-keyboard-optimization="true"] {
             /* iOS 下同时避让 Safari 底栏/软键盘和 Home Indicator 安全区。 */
             --codex-ios-bottom-avoidance: max(var(--codex-keyboard-inset-bottom, 0px), env(safe-area-inset-bottom, 0px));
           }
 
+          html[data-opencodex-ios-keyboard-optimization="true"] [data-app-shell-main-content-layout],
           html[data-opencodex-ios-keyboard-optimization="true"] .app-shell-main-content-viewport {
             --thread-floating-content-bottom-inset: calc(var(--spacing, 4px) * 3 + var(--codex-ios-bottom-avoidance, 0px));
           }
@@ -329,6 +451,11 @@
           root.style.removeProperty("--codex-visual-viewport-height");
           root.style.removeProperty("--codex-visual-viewport-offset-top");
           root.style.removeProperty("--codex-keyboard-inset-bottom");
+          root.style.removeProperty("--codex-browser-chrome-inset-bottom");
+          root.style.removeProperty("--opencodex-left-panel-width");
+          root.style.removeProperty("--opencodex-right-panel-width");
+          root.style.removeProperty("--opencodex-content-inline-inset");
+          root.removeAttribute("data-opencodex-android-keyboard-visible");
         }
         return enabled;
       };
@@ -344,12 +471,186 @@
         const keyboardInset = isIOSWebKitDevice()
           ? Math.max(0, layoutHeight - viewportBottom, innerHeight - viewportBottom)
           : Math.max(0, innerHeight - viewportBottom);
+        const keyboardFocused = isComposerEditableElement(document.activeElement);
+        if (!keyboardFocused && height > 0) stableUnfocusedVisualHeight = height;
+        const insets = viewportInsets(snapshot, keyboardFocused, stableUnfocusedVisualHeight);
         const root = document.documentElement;
         if (height > 0) setStyleValue(root, "--codex-visual-viewport-height", `${height}px`);
         setStyleValue(root, "--codex-visual-viewport-offset-top", `${offsetTop}px`);
         setStyleValue(root, "--codex-keyboard-inset-bottom", `${keyboardInset}px`);
+        setStyleValue(root, "--codex-browser-chrome-inset-bottom", `${isIOSWebKitDevice() ? 0 : insets.browserChromeInset}px`);
+        setDatasetValue(root, "opencodexAndroidKeyboardVisible", !isIOSWebKitDevice() && insets.keyboardVisible ? "true" : "false");
         modificationEffects?.primary?.emit();
       };
+
+      const panelIsHidden = (panel) => {
+        const ariaHidden = String(panel?.getAttribute?.("aria-hidden") || "").toLowerCase();
+        const state = String(panel?.getAttribute?.("data-state") || "").toLowerCase();
+        return ariaHidden === "true" || state === "closed" || state === "hidden";
+      };
+
+      let lastLeftPanelState = null;
+      let lastRightPanelState = null;
+      let preferredPanel = null;
+      let exclusionTimer = 0;
+      let exclusionRetryCount = 0;
+
+      const visibleButton = (selector) => Array.from(document.querySelectorAll(selector)).find((button) => {
+        const rect = button.getBoundingClientRect?.();
+        const style = w.getComputedStyle?.(button);
+        return rect && rect.width > 0 && rect.height > 0 && style?.display !== "none" && style?.visibility !== "hidden";
+      });
+
+      const fallbackButton = (selector) => Array.from(document.querySelectorAll(selector)).find((button) => {
+        const rect = button.getBoundingClientRect?.();
+        return rect && rect.width > 0 && rect.height > 0 && !button.disabled;
+      });
+
+      const leftToggleButton = () =>
+        visibleButton("button[data-app-shell-sidebar-trigger], button[aria-label='Hide sidebar'], button[aria-label='Show sidebar']") ||
+        fallbackButton("button[data-app-shell-sidebar-trigger], button[aria-label='Hide sidebar'], button[aria-label='Show sidebar']");
+      const rightToggleButton = () =>
+        visibleButton("button[aria-label='Toggle side panel']") || fallbackButton("button[aria-label='Toggle side panel']");
+
+      const clickOfficialToggle = (button) => {
+        if (!button || typeof button.click !== "function") return false;
+        button.click();
+        modificationEffects?.primary?.emit();
+        return true;
+      };
+
+      const panelState = () => {
+        const left = document.querySelector(".app-shell-left-panel");
+        const right = document.querySelector("aside[data-app-shell-focus-area='right-panel']");
+        const visible = (panel) => {
+          if (!panel || panelIsHidden(panel)) return false;
+          const rect = panel.getBoundingClientRect?.();
+          return !!rect && rect.width > 0 && rect.height > 0;
+        };
+        return { left, right, leftVisible: visible(left), rightVisible: visible(right) };
+      };
+
+      const enforcePanelExclusion = () => {
+        exclusionTimer = 0;
+        if (!isMobile()) return;
+        const state = panelState();
+        if (!state.leftVisible || !state.rightVisible) {
+          // panel 展開有 transition，首個 0ms 幾何值可能仍然係 0；短暫重試避免互斥漏判。
+          if (exclusionRetryCount < 3) {
+            exclusionRetryCount += 1;
+            exclusionTimer = scheduler.setTimeout(enforcePanelExclusion, 80);
+          }
+          return;
+        }
+        exclusionRetryCount = 0;
+        // 只透過官方按鈕關閉另一欄，唔直接改 React 控制嘅 DOM 狀態。
+        if (preferredPanel === "right") {
+          clickOfficialToggle(leftToggleButton());
+        } else {
+          clickOfficialToggle(rightToggleButton());
+        }
+      };
+
+      const schedulePanelExclusion = (preferred) => {
+        preferredPanel = preferred || preferredPanel;
+        exclusionRetryCount = 0;
+        if (exclusionTimer) scheduler.clearTimeout(exclusionTimer);
+        exclusionTimer = scheduler.setTimeout(enforcePanelExclusion, 0);
+      };
+
+      const syncLeftPanelState = () => {
+        const leftPanel = document.querySelector('.app-shell-left-panel');
+        if (!leftPanel || typeof leftPanel.getBoundingClientRect !== "function") {
+          document.documentElement.removeAttribute("data-opencodex-left-panel-visible");
+          return;
+        }
+        const rect = leftPanel.getBoundingClientRect();
+        const visible = rect.width > 0 && rect.height > 0 && !panelIsHidden(leftPanel);
+        const isMobileView = isMobile();
+
+        // 设置左侧栏可见状态到 html 元素
+        if (visible && isMobileView) {
+          document.documentElement.setAttribute("data-opencodex-left-panel-visible", "true");
+          leftPanel.setAttribute("data-opencodex-mobile-left-panel-overlay", "true");
+        } else {
+          document.documentElement.removeAttribute("data-opencodex-left-panel-visible");
+          leftPanel.removeAttribute("data-opencodex-mobile-left-panel-overlay");
+        }
+        lastLeftPanelState = visible;
+      };
+
+      const syncRightPanelMode = () => {
+        const panel = document.querySelector('aside[data-app-shell-focus-area="right-panel"]');
+        if (!panel || typeof panel.getBoundingClientRect !== "function") {
+          document.documentElement.removeAttribute("data-opencodex-right-panel-visible");
+          return;
+        }
+        const rect = panel.getBoundingClientRect();
+        const visible = rect.width > 0 && rect.height > 0 && !panelIsHidden(panel);
+        const isMobileView = isMobile();
+        if (visible && isMobileView) {
+          panel.setAttribute("data-opencodex-mobile-right-panel-overlay", "true");
+          document.documentElement.setAttribute("data-opencodex-right-panel-visible", "true");
+        } else {
+          panel.removeAttribute("data-opencodex-mobile-right-panel-overlay");
+          document.documentElement.removeAttribute("data-opencodex-right-panel-visible");
+        }
+
+        lastRightPanelState = visible;
+      };
+
+      const panelWidth = (selector, edge) => {
+        const panel = document.querySelector(selector);
+        if (!panel || typeof panel.getBoundingClientRect !== "function") return 0;
+        if (panel.matches?.('[data-opencodex-mobile-right-panel-overlay="true"]')) return 0;
+        const rect = panel.getBoundingClientRect();
+        if (rect.width <= 0 || rect.height <= 0) return 0;
+        const panelStyle = w.getComputedStyle ? w.getComputedStyle(panel) : null;
+        if (panelStyle && /^(fixed|absolute|sticky)$/.test(String(panelStyle.position || ""))) return 0;
+        if (edge === "left" && rect.left > 1) return 0;
+        if (edge === "right" && rect.right < (w.innerWidth || 0) - 1) return 0;
+        return Math.max(0, Math.ceil(rect.width));
+      };
+
+      const syncPanelGeometry = () => {
+        if (!isEnabled() || !isMobile()) return;
+        syncLeftPanelState();
+        syncRightPanelMode();
+        const state = panelState();
+        if (state.leftVisible && state.rightVisible) schedulePanelExclusion(preferredPanel);
+
+        const root = document.documentElement;
+        // 移动端左右侧栏都用 overlay 模式，主内容区不需要适应区域改变
+        // 参考百度文心设计：侧栏覆盖在主内容区上方，不影响布局
+        const leftWidth = 0;  // 始终为 0，因为左侧栏使用 fixed overlay
+        const rightWidth = 0; // 始终为 0，因为右侧栏使用 fixed overlay
+        setStyleValue(root, "--opencodex-left-panel-width", `${leftWidth}px`);
+        setStyleValue(root, "--opencodex-right-panel-width", `${rightWidth}px`);
+        setStyleValue(root, "--opencodex-content-inline-inset", `${leftWidth + rightWidth}px`);
+      };
+
+      let geometryTimer = 0;
+      const schedulePanelGeometry = () => {
+        if (geometryTimer) scheduler.clearTimeout(geometryTimer);
+        geometryTimer = scheduler.setTimeout(() => {
+          geometryTimer = 0;
+          syncPanelGeometry();
+        }, 80);
+      };
+
+      const disposeGeometryObservation = adapterHost.dom?.observe
+        ? adapterHost.dom.observe({
+            key: {},
+            root: document.body || document.documentElement,
+            options: { childList: true, subtree: true, attributes: true, attributeFilter: ["class", "style", "aria-hidden", "data-state"] },
+            callback: schedulePanelGeometry,
+          })
+        : () => {};
+      let geometryResizeObserver = null;
+      if (typeof w.ResizeObserver === "function") {
+        geometryResizeObserver = new w.ResizeObserver(schedulePanelGeometry);
+        geometryResizeObserver.observe(document.documentElement);
+      }
 
       const keepActiveInputVisible = (snapshot = viewportCoordinator.snapshot()) => {
         if (!isEnabled() || !isMobile()) return;
@@ -387,6 +688,7 @@
       const disposeViewport = viewportCoordinator.subscribe((snapshot) => {
         setViewportVars(snapshot);
         keepActiveInputVisible(snapshot);
+        syncPanelGeometry();
       });
 
       const preventZoomGesture = (event) => {
@@ -443,12 +745,31 @@
         adapterHost.events.observe({ key: {}, target: document, type: "gesturechange", passive: false, callback: preventZoomGesture }),
         adapterHost.events.observe({ key: {}, target: document, type: "pointerdown", capture: true, callback: rememberManualFocusIntent }),
         adapterHost.events.observe({ key: {}, target: document, type: "touchstart", capture: true, callback: rememberManualFocusIntent }),
+        adapterHost.events.observe({
+          key: {}, target: document, type: "click", capture: true,
+          callback: (event) => {
+            const button = event.target?.closest?.("button");
+            if (!button || !isMobile()) return;
+            if (button.matches("button[aria-label='Toggle side panel']")) {
+              syncPanelGeometry();
+              schedulePanelExclusion("right");
+            } else if (button.matches("button[data-app-shell-sidebar-trigger], button[aria-label='Hide sidebar'], button[aria-label='Show sidebar']")) {
+              syncPanelGeometry();
+              schedulePanelExclusion("left");
+            }
+          },
+        }),
       ];
 
       return () => {
         disposePreference();
         disposeIpcInvoke();
         disposeViewport();
+        if (geometryTimer) scheduler.clearTimeout(geometryTimer);
+        if (exclusionTimer) scheduler.clearTimeout(exclusionTimer);
+        exclusionRetryCount = 0;
+        disposeGeometryObservation();
+        geometryResizeObserver?.disconnect();
         disposeFocusHook();
         for (const disposeEvent of eventDisposers.reverse()) disposeEvent();
         if (style.parentNode) style.parentNode.removeChild(style);
@@ -457,6 +778,17 @@
         document.documentElement.style.removeProperty("--codex-visual-viewport-height");
         document.documentElement.style.removeProperty("--codex-visual-viewport-offset-top");
         document.documentElement.style.removeProperty("--codex-keyboard-inset-bottom");
+        document.documentElement.style.removeProperty("--codex-browser-chrome-inset-bottom");
+        document.documentElement.style.removeProperty("--opencodex-left-panel-width");
+        document.documentElement.style.removeProperty("--opencodex-right-panel-width");
+        document.documentElement.style.removeProperty("--opencodex-content-inline-inset");
+        document.documentElement.removeAttribute("data-opencodex-android-keyboard-visible");
+        document.querySelectorAll?.('[data-opencodex-mobile-right-panel-overlay="true"]').forEach((panel) => {
+          panel.removeAttribute("data-opencodex-mobile-right-panel-overlay");
+        });
+        document.querySelectorAll?.('[data-opencodex-mobile-left-panel-overlay="true"]').forEach((panel) => {
+          panel.removeAttribute("data-opencodex-mobile-left-panel-overlay");
+        });
         document.__opencodexMobileKeyboardPluginInstalled = false;
       };
     },

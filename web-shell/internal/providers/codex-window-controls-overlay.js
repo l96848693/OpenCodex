@@ -1,15 +1,165 @@
 (function () {
   const w = window;
+  const modificationScope = w.__OpenCodexCurrentProviderScope;
+  const modificationEffects = modificationScope?.effects;
   const adapterHost = w.__OpenCodexAdapterHost;
-  if (!adapterHost?.providers?.registerManaged) return;
+  const scheduler = adapterHost?.scheduler?.capture?.() || w;
+  if (!adapterHost?.dom?.observe || !adapterHost?.events?.observe) return;
 
-  // 脚本加载只登记实现；DOM 副作用由 RuntimeView Contribution 的 apply/dispose 生命周期托管。
-  adapterHost.providers.registerManaged("window-controls", "primary", ({ onHit }) => {
-    const scheduler = adapterHost.scheduler?.capture?.() || w;
-    if (!adapterHost.dom?.observe || !adapterHost.events?.observe) {
-      throw new Error("PWA 标题栏 Provider 缺少共享 DOM 或事件能力");
+  /**
+   * 將 Desktop 專用 app://fs URL 同步轉成 Gateway URL。
+   * 呢層必須早過官方 React 掛載：MutationObserver 只會喺瀏覽器已經發出錯誤請求後先收到通知。
+   */
+  function appFsUrlToGatewayUrl(value) {
+    if (typeof value !== "string" || !value.startsWith("app://fs/")) return null;
+    try {
+      const url = new URL(value);
+      if (url.protocol !== "app:" || url.hostname !== "fs" || !url.pathname.startsWith("/@fs/")) return null;
+      const decodedPath = decodeURIComponent(url.pathname.slice("/@fs/".length));
+      const encodedPath = decodedPath
+        .split("/")
+        .filter((part, index) => index === 0 || part.length > 0)
+        .map((part) => encodeURIComponent(part))
+        .join("/");
+      return new URL(`/api/app-fs/@fs/${encodedPath}`, location.origin).href;
+    } catch {
+      return null;
     }
-    let contributionStyles = null;
+  }
+
+  /**
+   * 喺 DOM 寫入 src/href 嗰一刻改寫 app://fs，避免 Chromium 先記錄 ERR_UNKNOWN_URL_SCHEME。
+   * 只攔截 img/source/link 嘅資源屬性，其他 Element 行為保持官方原樣。
+   */
+  function installEarlyAppFsResourceGuard() {
+    const elementProto = w.Element?.prototype;
+    if (!elementProto || typeof elementProto.setAttribute !== "function" || elementProto.__codexAppFsResourceGuard) return;
+    const originalSetAttribute = elementProto.setAttribute;
+    const guardedSetAttribute = function guardedSetAttribute(name, value) {
+      const attribute = String(name || "").toLowerCase();
+      const tagName = String(this?.tagName || "").toLowerCase();
+      const isResourceAttribute =
+        (attribute === "src" && (tagName === "img" || tagName === "source")) ||
+        (attribute === "href" && tagName === "link");
+      const rewritten = isResourceAttribute ? appFsUrlToGatewayUrl(value) : null;
+      return originalSetAttribute.call(this, name, rewritten || value);
+    };
+
+    const guardResourceProperty = (prototype, property) => {
+      if (!prototype) return;
+      const marker = `__codexAppFs${property[0].toUpperCase()}${property.slice(1)}Guard`;
+      if (prototype[marker]) return;
+      const descriptor = Object.getOwnPropertyDescriptor(prototype, property);
+      if (!descriptor?.set || !descriptor.configurable) return;
+      const originalSetter = descriptor.set;
+      Object.defineProperty(prototype, property, {
+        ...descriptor,
+        set(value) {
+          return originalSetter.call(this, appFsUrlToGatewayUrl(value) || value);
+        },
+      });
+      Object.defineProperty(prototype, marker, { configurable: true, value: true });
+    };
+    try {
+      Object.defineProperty(elementProto, "setAttribute", { configurable: true, writable: true, value: guardedSetAttribute });
+      Object.defineProperty(elementProto, "__codexAppFsResourceGuard", { configurable: true, value: true });
+      guardResourceProperty(w.HTMLImageElement?.prototype, "src");
+      guardResourceProperty(w.HTMLSourceElement?.prototype, "src");
+      guardResourceProperty(w.HTMLLinkElement?.prototype, "href");
+      w.__opencodexAppFsUrlToGatewayUrl = appFsUrlToGatewayUrl;
+    } catch {
+      // 原型被鎖定時保留 MutationObserver 後備路徑，唔阻斷官方頁面啟動。
+    }
+  }
+
+  installEarlyAppFsResourceGuard();
+
+  /**
+   * 官方 Statsig SDK 會喺 bridge 安裝前保存 fetch 引用；只喺 bridge 再包 fetch 已經太遲。
+   * 呢層最早期攔截只處理遙測上報，唔改初始化、功能門或者其他網絡請求。
+   */
+  function installEarlyStatsigTelemetryGuard() {
+    if (typeof w.fetch !== "function" || w.__codexEarlyStatsigTelemetryGuard) return;
+    const originalFetch = w.fetch.bind(w);
+    const isTelemetryUrl = (value) => {
+      try {
+        const parsed = new URL(String(value || ""), location.href);
+        const pathname = parsed.pathname.replace(/\/+$/, "");
+        return (
+          parsed.hostname === "chatgpt.com" &&
+          (pathname === "/ces/v1/rgstr" || pathname === "/ces/v1/log_event")
+        );
+      } catch {
+        return false;
+      }
+    };
+    w.fetch = (input, init) => {
+      const url =
+        typeof input === "string"
+          ? input
+          : input && typeof input === "object" && "url" in input
+            ? String(input.url || "")
+            : "";
+      if (isTelemetryUrl(url)) {
+        modificationEffects?.telemetry?.emit();
+        return Promise.resolve(
+          new Response("{}", {
+            status: 200,
+            headers: { "content-type": "application/json; charset=utf-8" },
+          })
+        );
+      }
+      return originalFetch(input, init);
+    };
+    Object.defineProperty(w, "__codexEarlyStatsigTelemetryGuard", {
+      configurable: true,
+      value: true,
+    });
+  }
+
+  installEarlyStatsigTelemetryGuard();
+
+  // 官方 renderer 有机会把未初始化的坐标传入 elementFromPoint；先在最早加载的兼容脚本拦截，
+  // 避免异常先于 bridge 安装而直接冒泡到浏览器控制台。
+  function installFiniteElementFromPointGuard() {
+    const proto = w.Document?.prototype;
+    if (!proto || typeof proto.elementFromPoint !== "function" || proto.__codexFiniteElementFromPoint) return;
+    const original = proto.elementFromPoint;
+    const guarded = function guardedElementFromPoint(x, y) {
+      if (!Number.isFinite(Number(x)) || !Number.isFinite(Number(y))) return null;
+      try {
+        return original.call(this, x, y);
+      } catch (error) {
+        // Chromium 对非有限 WebIDL 参数会抛 TypeError；兼容层只吞掉这一类输入错误。
+        if (error instanceof TypeError && /non-finite|finite|double value/i.test(String(error.message || ""))) {
+          return null;
+        }
+        throw error;
+      }
+    };
+    try {
+      Object.defineProperty(proto, "elementFromPoint", { configurable: true, value: guarded });
+      Object.defineProperty(proto, "__codexFiniteElementFromPoint", { value: true, configurable: true });
+      if (w.document && typeof w.document.elementFromPoint === "function") {
+        Object.defineProperty(w.document, "elementFromPoint", { configurable: true, value: guarded });
+      }
+    } catch {
+      // 只读浏览器原型时保留官方实现，不能影响页面启动。
+    }
+  }
+
+  installFiniteElementFromPointGuard();
+  const activeRoot = document.documentElement || null;
+  const previousInstallState = w.__opencodexWindowControlsOverlayState;
+  if (previousInstallState?.document === document && previousInstallState?.root === activeRoot) return;
+  try {
+    previousInstallState?.cleanup?.();
+  } catch {
+    // 旧页面可能已经被 document.write 清空，清理失败时不能阻断当前页面重新安装。
+  }
+  // Web shell 会先加载登录壳，再用 document.write 写入官方 renderer；guard 必须跟随当前根节点。
+  const installState = { document, root: activeRoot, cleanup: null };
+  w.__opencodexWindowControlsOverlayState = installState;
 
   /**
    * PWA window-controls-overlay 会把页面铺到系统标题栏下方。
@@ -25,20 +175,6 @@
     const root = document.documentElement;
     const rootStyle = root.style;
     const cleanupHandlers = [];
-    const initialRootStyles = new Map();
-    const managedAttributeNodes = new Map();
-    const managedRootDatasetKeys = [
-      "opencodexWcoVisible",
-      "opencodexWcoTitlebarScheme",
-      "opencodexWcoImagePreviewOpen",
-      "opencodexWcoImagePreviewScheme",
-    ];
-    const initialRootDataset = new Map(
-      managedRootDatasetKeys.map((key) => [
-        key,
-        Object.prototype.hasOwnProperty.call(root.dataset, key) ? root.dataset[key] : undefined,
-      ])
-    );
 
     function addCleanup(handler) {
       if (typeof handler === "function") cleanupHandlers.push(handler);
@@ -96,7 +232,6 @@
       link.href = "/codex-window-controls-overlay.css";
       // WCO 适配样式体积较大，独立 CSS 文件比塞进 polyfill 更容易维护。
       (document.head || document.documentElement).appendChild(link);
-      contributionStyles = link;
     }
 
     function setInsets(visible, insets) {
@@ -157,16 +292,14 @@
     let inactiveMetricsSynced = false;
     let compatibilityHitReported = false;
     let currentImagePreviewRoot = null;
-    const RIGHT_PANEL_FOCUS_SELECTOR = '[data-app-shell-focus-area="right-panel"]';
     const METRIC_MOUNT_SELECTOR = [
       "header[data-app-shell-header-edge-scroll]",
-      RIGHT_PANEL_FOCUS_SELECTOR,
+      'aside[data-app-shell-focus-area="right-panel"]',
       '[data-app-shell-tab-strip-controller="right"]',
       '[data-testid="image-preview-dismiss-area"]',
     ].join(",");
 
     function setManagedRootStyle(name, value) {
-      rememberRootStyle(name);
       const nextValue = String(value);
       if (rootStyle.getPropertyValue(name) === nextValue) return;
       // 每次实际自写对应一个 style MutationRecord，observer 据此只过滤自身产生的记录。
@@ -175,73 +308,9 @@
     }
 
     function removeManagedRootStyle(name) {
-      rememberRootStyle(name);
       if (!rootStyle.getPropertyValue(name)) return;
       if (disposeMutationObservation) managedRootStyleMutationBudget += 1;
       rootStyle.removeProperty(name);
-    }
-
-    function rememberRootStyle(name) {
-      if (initialRootStyles.has(name)) return;
-      initialRootStyles.set(name, {
-        priority: rootStyle.getPropertyPriority(name),
-        value: rootStyle.getPropertyValue(name),
-      });
-    }
-
-    function restoreManagedDomState() {
-      for (const [name, initial] of initialRootStyles) {
-        if (initial.value) rootStyle.setProperty(name, initial.value, initial.priority);
-        else rootStyle.removeProperty(name);
-      }
-      for (const [key, initial] of initialRootDataset) {
-        if (initial === undefined) delete root.dataset[key];
-        else root.dataset[key] = initial;
-      }
-      // 只清理由当前实例实际标记过的节点，页面代际切换时不会误触新文档中的同名节点。
-      for (const [attribute, nodes] of managedAttributeNodes) {
-        for (const node of nodes) node.removeAttribute(attribute);
-      }
-      managedAttributeNodes.clear();
-      contributionStyles?.remove();
-      contributionStyles = null;
-    }
-
-    function setManagedNodeAttribute(node, attribute, value = "true") {
-      if (!node) return;
-      node.setAttribute(attribute, value);
-      let nodes = managedAttributeNodes.get(attribute);
-      if (!nodes) {
-        nodes = new Set();
-        managedAttributeNodes.set(attribute, nodes);
-      }
-      nodes.add(node);
-    }
-
-    function removeManagedNodeAttribute(node, attribute) {
-      if (!node) return;
-      node.removeAttribute(attribute);
-      managedAttributeNodes.get(attribute)?.delete(node);
-    }
-
-    function visibleLayoutElement(element) {
-      if (!(element instanceof HTMLElement)) return false;
-      const rect = element.getBoundingClientRect();
-      if (rect.width <= 0 || rect.height <= 0) return false;
-      const style = w.getComputedStyle(element);
-      return style.display !== "none" && style.visibility !== "hidden";
-    }
-
-    function firstVisibleElement(selector) {
-      const candidates = Array.from(document.querySelectorAll(selector));
-      return candidates.find(visibleLayoutElement) || candidates[0] || null;
-    }
-
-    function directHeaderSlots(header) {
-      if (!(header instanceof HTMLElement)) return [];
-      return Array.from(header.children).filter(
-        (child) => child instanceof HTMLElement && child.getAttribute("data-test-id") === "header-shell-slot"
-      );
     }
 
     function parseRgbColor(value) {
@@ -357,7 +426,7 @@
       const titlebarHeight = Math.max(1, measureCssLength("var(--opencodex-wco-height)"));
       const probeY = Math.max(0, Math.min(viewportHeight - 1, titlebarTop + titlebarHeight / 2));
       const minSurfaceWidth = Math.max(titlebarHeight * 3, Math.min(viewportWidth, titlebarWidth) * 0.12);
-      const header = firstVisibleElement("header[data-app-shell-header-edge-scroll]");
+      const header = document.querySelector("header[data-app-shell-header-edge-scroll]");
       const fallback = findTokenSurfaceColor();
       const centerX =
         titlebarWidth > 0
@@ -488,102 +557,134 @@
       setImagePreviewThemeColor(root.dataset.opencodexWcoVisible === "true" ? scrimColor : "");
 
       for (const node of document.querySelectorAll('[data-opencodex-wco-image-preview="true"]')) {
-        if (node !== previewRoot) removeManagedNodeAttribute(node, "data-opencodex-wco-image-preview");
+        if (node !== previewRoot) node.removeAttribute("data-opencodex-wco-image-preview");
       }
       for (const node of document.querySelectorAll('[data-opencodex-wco-image-preview-controls="true"]')) {
-        removeManagedNodeAttribute(node, "data-opencodex-wco-image-preview-controls");
+        node.removeAttribute("data-opencodex-wco-image-preview-controls");
       }
       if (!previewRoot) return;
 
-      setManagedNodeAttribute(previewRoot, "data-opencodex-wco-image-preview");
+      previewRoot.setAttribute("data-opencodex-wco-image-preview", "true");
       const controls = Array.from(previewRoot.children).find((child) => {
         if (!(child instanceof HTMLElement)) return false;
         return child.classList.contains("top-3") && child.classList.contains("right-3") && child.querySelector("a,button");
       });
       // 官方图片预览没有稳定 test id，这里按直接子节点的 top/right 工具条特征补一个稳定标记。
-      setManagedNodeAttribute(controls, "data-opencodex-wco-image-preview-controls");
+      controls?.setAttribute("data-opencodex-wco-image-preview-controls", "true");
     }
 
     function syncRightHeaderSlotMetrics() {
       rightHeaderSlotMetricsQueued = false;
-      const header = firstVisibleElement("header[data-app-shell-header-edge-scroll]");
-      const slots = directHeaderSlots(header);
-      const slot = slots[slots.length - 1] || null;
-      for (const node of document.querySelectorAll('[data-opencodex-wco-right-slot="true"]')) {
-        if (node !== slot) removeManagedNodeAttribute(node, "data-opencodex-wco-right-slot");
-      }
-      for (const node of document.querySelectorAll('[data-opencodex-wco-align-right-panel="true"]')) {
-        if (node !== slot) removeManagedNodeAttribute(node, "data-opencodex-wco-align-right-panel");
-      }
-      // 官方 header 末尾可能继续挂载标题栏障碍节点，不能再用 :last-child 判断右侧 slot。
-      setManagedNodeAttribute(slot, "data-opencodex-wco-right-slot");
-      const headerRect = header?.getBoundingClientRect();
-      const rightPanel = headerRect
-        ? Array.from(document.querySelectorAll(`aside${RIGHT_PANEL_FOCUS_SELECTOR}`)).find((candidate) => {
-            if (!visibleLayoutElement(candidate)) return false;
-            const panelRect = candidate.getBoundingClientRect();
-            // 只有覆盖标题栏右边缘的物理右侧栏，才应决定 end slot 的占位宽度。
-            return panelRect.left < headerRect.right && panelRect.right >= headerRect.right - 1;
-          })
-        : null;
-      const panelRect = rightPanel?.getBoundingClientRect();
-      const overlapWidth =
-        headerRect && panelRect
-          ? Math.max(
+      const header = document.querySelector("header[data-app-shell-header-edge-scroll]");
+      const slot =
+        header?.querySelector(':scope > [data-test-id="header-shell-slot"]:last-child') ||
+        document.querySelector('header[data-app-shell-header-edge-scroll] > [data-test-id="header-shell-slot"]:last-child');
+      const inner = slot?.firstElementChild;
+      let fixedWidth = 0;
+      let leadingWidth = 0;
+      if (inner) {
+        const children = Array.from(inner.children);
+        const fixedIndex = children.findIndex((child) => child.classList.contains("ms-auto"));
+        const hasLeading = fixedIndex > 0;
+        slot.toggleAttribute("data-opencodex-wco-has-leading", hasLeading);
+        header?.toggleAttribute("data-opencodex-wco-has-right-leading", hasLeading);
+        for (const [index, child] of children.entries()) {
+          const isLeading = hasLeading && index < fixedIndex;
+          const isFixed = hasLeading && index >= fixedIndex;
+          // 官方 DOM 没有把「可收缩标签区」包成一组，这里按 .ms-auto 分界补充稳定标记。
+          child.toggleAttribute("data-opencodex-wco-leading", isLeading);
+          child.toggleAttribute("data-opencodex-wco-fixed", isFixed);
+        }
+        if (hasLeading) {
+          const fixedChildren = children.slice(fixedIndex);
+          const fixedRects = fixedChildren
+            .map((child) => child.getBoundingClientRect())
+            .filter((rect) => rect.width > 0 || rect.height > 0);
+          if (fixedRects.length > 0) {
+            const fixedLeft = Math.min(...fixedRects.map((rect) => rect.left));
+            const fixedRight = Math.max(...fixedRects.map((rect) => rect.right));
+            const headerRect = header?.getBoundingClientRect();
+            const innerRect = inner.getBoundingClientRect();
+            const slotRect = slot.getBoundingClientRect();
+            const innerStyle = w.getComputedStyle(inner);
+            const gap = Math.max(
               0,
-              Math.min(headerRect.right, panelRect.right) - Math.max(headerRect.left, panelRect.left)
-            )
-          : 0;
-      const alignedWidth = Math.round(overlapWidth * 100) / 100;
-      if (slot && alignedWidth > 0) {
-        setManagedNodeAttribute(slot, "data-opencodex-wco-align-right-panel");
+              Number.parseFloat(innerStyle.columnGap || innerStyle.gap || "0") || 0
+            );
+            const visibleSlotRight = Math.min(slotRect.right, headerRect?.right ?? slotRect.right);
+            // 固定按钮组要连同右侧 padding 一起保留，避免默认按钮再次被标题栏裁掉。
+            fixedWidth = Math.ceil(Math.max(0, visibleSlotRight - fixedLeft));
+            // 侧栏标签的右边界直接取固定按钮左边界，扣掉 flex gap 后不会再压到按钮上。
+            const leadingRight = Math.min(fixedLeft, visibleSlotRight - Math.max(0, fixedRight - fixedLeft));
+            leadingWidth = Math.max(0, Math.floor(leadingRight - innerRect.left - gap));
+          }
+        }
+      } else if (slot) {
+        slot.removeAttribute("data-opencodex-wco-has-leading");
+        header?.removeAttribute("data-opencodex-wco-has-right-leading");
       } else {
-        removeManagedNodeAttribute(slot, "data-opencodex-wco-align-right-panel");
+        header?.removeAttribute("data-opencodex-wco-has-right-leading");
       }
-      setManagedRootStyle("--opencodex-wco-right-slot-width", `${alignedWidth}px`);
-
-      // 清理旧版按内部按钮分组收缩 slot 留下的状态。
-      for (const [selector, attribute] of [
-        ['[data-opencodex-wco-has-leading]', "data-opencodex-wco-has-leading"],
-        ['[data-opencodex-wco-leading]', "data-opencodex-wco-leading"],
-        ['[data-opencodex-wco-fixed]', "data-opencodex-wco-fixed"],
-      ]) {
-        for (const node of document.querySelectorAll(selector)) node.removeAttribute(attribute);
+      const nextSlotMin = `${fixedWidth}px`;
+      if (rootStyle.getPropertyValue("--opencodex-wco-right-slot-min") !== nextSlotMin) {
+        setManagedRootStyle("--opencodex-wco-right-slot-min", nextSlotMin);
       }
-      removeManagedRootStyle("--opencodex-wco-right-slot-min");
-      removeManagedRootStyle("--opencodex-wco-leading-max");
+      const nextLeadingMax = `${leadingWidth}px`;
+      if (rootStyle.getPropertyValue("--opencodex-wco-leading-max") !== nextLeadingMax) {
+        setManagedRootStyle("--opencodex-wco-leading-max", nextLeadingMax);
+      }
     }
 
     function syncRightPanelTabStripMetrics() {
-      const strips = Array.from(
-        document.querySelectorAll('[data-app-shell-tab-strip-controller="right"]')
-      );
-      // 缓存路由里可能残留不可见 strip，只能让当前右侧面板中的可见实例参与布局。
-      const strip = strips.find(
-        (candidate) => candidate.closest?.(RIGHT_PANEL_FOCUS_SELECTOR) && visibleLayoutElement(candidate)
-      ) || null;
-      const toolbarCandidate = strip?.closest?.('[data-app-shell-tab-row]') || strip?.parentElement;
-      const toolbar = toolbarCandidate instanceof HTMLElement ? toolbarCandidate : null;
+      const strip =
+        document.querySelector(
+          'aside[data-app-shell-focus-area="right-panel"] [data-app-shell-tab-strip-controller="right"]'
+        ) || document.querySelector('[data-app-shell-tab-strip-controller="right"]');
+      const toolbar = strip?.parentElement instanceof HTMLElement ? strip.parentElement : null;
+      const header = document.querySelector("header[data-app-shell-header-edge-scroll]");
       for (const node of document.querySelectorAll('[data-opencodex-wco-right-panel-toolbar="true"]')) {
-        if (node !== toolbar) removeManagedNodeAttribute(node, "data-opencodex-wco-right-panel-toolbar");
+        if (node !== toolbar) node.removeAttribute("data-opencodex-wco-right-panel-toolbar");
       }
-      // 清除旧版跨分栏位移留下的状态，热更新后也不能继续影响当前页面。
-      for (const [selector, attribute] of [
-        ['[data-opencodex-wco-right-panel-strip="true"]', "data-opencodex-wco-right-panel-strip"],
-        [
-          '[data-opencodex-wco-right-panel-toolbar-clip="true"]',
-          "data-opencodex-wco-right-panel-toolbar-clip",
-        ],
-      ]) {
-        for (const node of document.querySelectorAll(selector)) {
-          node.removeAttribute(attribute);
+      for (const node of document.querySelectorAll('[data-opencodex-wco-right-panel-strip="true"]')) {
+        if (node !== strip) node.removeAttribute("data-opencodex-wco-right-panel-strip");
+      }
+      header?.toggleAttribute("data-opencodex-wco-has-right-panel-toolbar", Boolean(toolbar));
+      const clipNodes = new Set();
+      let extend = 0;
+      if (toolbar) {
+        const leftSlot = header?.querySelector(':scope > [data-test-id="header-shell-slot"]:first-child');
+        const headerRect = header?.getBoundingClientRect();
+        const leftSlotRect = leftSlot?.getBoundingClientRect();
+        const stripRect = strip.getBoundingClientRect();
+        const appliedExtend =
+          Number.parseFloat(rootStyle.getPropertyValue("--opencodex-wco-right-panel-toolbar-extend") || "0") || 0;
+        const toolbarStyle = w.getComputedStyle(toolbar);
+        const toolbarGap = Math.max(
+          0,
+          Number.parseFloat(toolbarStyle.columnGap || toolbarStyle.gap || "0") || 0
+        );
+        const minStripLeft = Math.max(headerRect?.left ?? 0, (leftSlotRect?.right ?? stripRect.left) + toolbarGap);
+        // stripRect.left 会受上一轮负 margin 影响；加回已应用扩展量后再计算，避免扩展值来回抖动。
+        extend = Math.max(0, Math.floor(stripRect.left + appliedExtend - minStripLeft));
+        for (let node = toolbar.parentElement; node instanceof HTMLElement; node = node.parentElement) {
+          clipNodes.add(node);
+          if (node.matches('aside[data-app-shell-focus-area="right-panel"]')) break;
         }
+        // 官方 sticky 按钮和 scroll-padding 都在 strip 内部，Web shell 只移动 strip 左边界并保留右边界。
+        toolbar.setAttribute("data-opencodex-wco-right-panel-toolbar", "true");
+        strip.setAttribute("data-opencodex-wco-right-panel-strip", "true");
       }
-      for (const header of document.querySelectorAll("header[data-opencodex-wco-has-right-panel-toolbar]")) {
-        header.removeAttribute("data-opencodex-wco-has-right-panel-toolbar");
+      for (const node of document.querySelectorAll('[data-opencodex-wco-right-panel-toolbar-clip="true"]')) {
+        if (!clipNodes.has(node)) node.removeAttribute("data-opencodex-wco-right-panel-toolbar-clip");
       }
-      removeManagedRootStyle("--opencodex-wco-right-panel-toolbar-extend");
-      setManagedNodeAttribute(toolbar, "data-opencodex-wco-right-panel-toolbar");
+      for (const node of clipNodes) {
+        node.setAttribute("data-opencodex-wco-right-panel-toolbar-clip", "true");
+      }
+      const nextExtend = `${extend}px`;
+      if (rootStyle.getPropertyValue("--opencodex-wco-right-panel-toolbar-extend") !== nextExtend) {
+        setManagedRootStyle("--opencodex-wco-right-panel-toolbar-extend", nextExtend);
+      }
+      // 不主动改 scrollLeft、tablist padding 或 sticky 子节点；官方 tab strip 自己维护滚动位置。
     }
 
     function syncHeaderAndPanelMetrics() {
@@ -702,7 +803,7 @@
       if (visible && overlay && typeof overlay.getTitlebarAreaRect === "function") {
         if (!compatibilityHitReported) {
           compatibilityHitReported = true;
-          onHit();
+          modificationEffects?.primary?.emit();
         }
         startHeavyObservers();
         const rect = overlay.getTitlebarAreaRect();
@@ -713,7 +814,7 @@
       if (visible) {
         if (!compatibilityHitReported) {
           compatibilityHitReported = true;
-          onHit();
+          modificationEffects?.primary?.emit();
         }
         startHeavyObservers();
         setInsets(true, null);
@@ -762,28 +863,17 @@
       }
       cssLengthProbe?.remove();
       cssColorProbe?.remove();
-      restoreManagedDomState();
     };
   }
 
-    const cleanup = installWindowControlsOverlaySafeArea();
-    if (!cleanup) throw new Error("PWA 标题栏 Provider 无法定位当前文档根节点");
-    let active = true;
-    return Object.freeze({
-      verify() {
-        if (!active) throw new Error("PWA 标题栏 Contribution 已经释放");
-        const styles = document.getElementById("codex-web-window-controls-overlay-styles") || contributionStyles;
-        const stylesConnected = styles ? styles.isConnected ?? Boolean(styles.parentNode) : false;
-        if (!stylesConnected) {
-          throw new Error("PWA 标题栏样式没有连接到当前页面");
-        }
-      },
-      dispose() {
-        if (!active) return;
-        active = false;
-        cleanup();
-      },
+  installState.cleanup = installWindowControlsOverlaySafeArea() || null;
+  if (installState.cleanup && modificationScope?.own) {
+    const cleanup = installState.cleanup;
+    installState.cleanup = modificationScope.own(() => {
+      cleanup();
+      if (w.__opencodexWindowControlsOverlayState === installState) {
+        w.__opencodexWindowControlsOverlayState = null;
+      }
     });
-
-  });
+  }
 })();

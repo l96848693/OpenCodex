@@ -80,11 +80,6 @@ const OFFICIAL_LOADING_SHIMMER_POWER_GUARD = [
   "</style>",
 ].join("");
 const WEB_SHELL_ASSETS_DIR = path.join(WEB_SHELL_DIR, "assets");
-/**
- * 官方 main 运行时把“打开方式”菜单图标写成相对路径 `apps/<name>.png`。
- * 浏览器按当前页面 URL 解析它，因此站点根得到 /apps/，深链路由得到 /<route>/apps/。
- */
-const OFFICIAL_APP_ICON_FILE = /^[A-Za-z0-9][A-Za-z0-9._-]*\.(?:png|svg|webp|avif|ico|jpe?g|gif)$/i;
 const OPENCODEX_MODIFICATION_RUNTIME_FILE = path.join(
   __dirname,
   "..",
@@ -137,11 +132,19 @@ const APPLICATION_MENU_CAPABILITY_CHECK_AT_START_RE =
   /\b[A-Za-z_$][\w$]*\(\)\s*&&\s*[A-Za-z_$][\w$]*\??\.applicationMenu\s*!={1,2}\s*(?:null|void 0)\b/y;
 const APPLICATION_MENU_SERVICE_USAGE_RE =
   /\b[A-Za-z_$][\w$]*\??\.applicationMenu\??\.(?:getSnapshot|invokeItem)\b/;
+const PROJECT_ORDER_APP_HOST_QUERY_TOKEN = "getInstance().post(`vscode://codex/${";
+const PROJECT_ORDER_APP_HOST_QUERY_RE =
+  /async function ([A-Za-z_$][\w$]*)\(([A-Za-z_$][\w$]*),([A-Za-z_$][\w$]*),([A-Za-z_$][\w$]*),([A-Za-z_$][\w$]*),([A-Za-z_$][\w$]*)\)\{let ([A-Za-z_$][\w$]*)=\(await ([A-Za-z_$][\w$]*)\.getInstance\(\)\.post\(`vscode:\/\/codex\/\$\{\2\}`,JSON\.stringify\(\3\),([A-Za-z_$][\w$]*)\(\6\),\5\)\)\.body;return \4\?\4\(\7\):\7\}/g;
+const PROJECT_RECENT_GROUP_ORDER_TOKEN = "projectOrder:";
+const PROJECT_RECENT_GROUP_ORDER_RE =
+  /function ([A-Za-z_$][\w$]*)\(\{groups:([A-Za-z_$][\w$]*),projectOrder:([A-Za-z_$][\w$]*)\}\)\{return ([A-Za-z_$][\w$]*)\(\2,\3\)\}/g;
 const APP_SERVER_REQUEST_CLIENT_FIELDS_RE =
-  /pendingConfigReadRequests=new Map;queuedRequests=\[\]/;
+  /pendingConfigReadRequests=new Map;/;
 const APP_SERVER_REQUEST_CLIENT_DISPATCH_ERROR = "AppServerRequestClient is missing a message dispatcher";
+// Samsung Internet 22 使用旧 Chromium；官方 ES2025 feature probe 直接构造 /v/ 会令整页 SyntaxError。
+const REGEXP_UNICODE_SETS_PROBE_TOKEN = "bf.bugNestedClassIgnoresNegation=bf.unicodeSets&&RegExp(`[[^a]]`,`v`).test(`a`)";
 const APP_SERVER_REQUEST_CLIENT_SEND_RE =
-  /async sendRequest\(([A-Za-z_$][\w$]*),([A-Za-z_$][\w$]*),([A-Za-z_$][\w$]*)\)\{if\(this\.dispatchMessage==null\)throw Error\(`AppServerRequestClient is missing a message dispatcher`\);return \1===`config\/read`\?this\.sendConfigReadRequest\(\2,\3\):this\.enqueueRequest\(\1,\2,\3\)\}/;
+  /async sendRequest\(([A-Za-z_$][\w$]*),([A-Za-z_$][\w$]*),([A-Za-z_$][\w$]*)\)\{if\(this\.dispatchMessage==null\)throw Error\(`AppServerRequestClient is missing a message dispatcher`\);return \1===`config\/read`\?this\.sendConfigReadRequest\(\2,\3\):this\.enqueueRequest\(\1,\2,((?:\3|\1===`plugin\/list`&&\3\?\.timeoutMs==null\?\{\.\.\.\3,timeoutMs:[A-Za-z_$][\w$]*\}:\3))\)\}/;
 const APP_SERVER_BACKGROUND_METHODS_RE =
   /new Set\(\[(?:`app\/installed`,)?`app\/list`(?:,`app\/read`)?,`collaborationMode\/list`,`config\/read`,`configRequirements\/read`,`experimentalFeature\/list`,`hooks\/list`,`mcpServerStatus\/list`,`model\/list`,`permissionProfile\/list`,`plugin\/list`,`skills\/list`\]\)/;
 const APP_SERVER_BACKGROUND_METHODS = [
@@ -155,6 +158,9 @@ const PLUGIN_SUMMARY_IMAGE_EAGER_RE =
   /Promise\.all\(\[\s*([A-Za-z_$][\w$]*)\(([A-Za-z_$][\w$]*)\.composerIconPath\s*,\s*([A-Za-z_$][\w$]*)\s*,\s*([A-Za-z_$][\w$]*)\)\s*,\s*\1\(\2\.logoPath\s*,\s*\3\s*,\s*\4\)\s*,\s*\1\(\2\.logoDarkPath\s*,\s*\3\s*,\s*\4\)\s*\]\)/g;
 const PLUGIN_SUMMARY_IMAGE_LAYOUT_HINT_RE =
   /Promise\.all\(\[[\s\S]{0,240}\.composerIconPath[\s\S]{0,240}\.logoPath[\s\S]{0,240}\.logoDarkPath[\s\S]{0,240}\]\)/;
+// 官方新版將三張插件圖標拆到獨立遞歸函數；保留同源 lazy URL，避免 app://fs 先被瀏覽器嘗試。
+const PLUGIN_SUMMARY_IMAGE_RECURSIVE_RE =
+  /Promise\.all\(\[\s*([A-Za-z_$][\w$]*)\(([A-Za-z_$][\w$]*)\.composerIconPath,([A-Za-z_$][\w$]*),([A-Za-z_$][\w$]*),([A-Za-z_$][\w$]*)\),\s*\1\(\2\.logoPath,\3,\4,\5\),\s*\1\(\2\.logoDarkPath,\3,\4,\5\)\s*\]\)/;
 
 let officialAssetPatchWorker = null;
 let officialAssetPatchWorkerIdleTimer = null;
@@ -787,35 +793,6 @@ function createStaticAssetService({
     return { body, encoding };
   }
 
-  function htmlAttributeValue(attributes, name) {
-    const match = String(attributes || "").match(
-      new RegExp(`(?:^|\\s)${escapeRegExp(name)}\\s*=\\s*(?:"([^"]*)"|'([^']*)'|([^\\s"'=<>]+))`, "i")
-    );
-    return match ? match[1] ?? match[2] ?? match[3] ?? "" : null;
-  }
-
-  function hasHtmlAttribute(attributes, name) {
-    return new RegExp(`(?:^|\\s)${escapeRegExp(name)}(?=\\s|=|/|$)`, "i").test(String(attributes || ""));
-  }
-
-  function officialHtmlHasEagerScript(rawHtml) {
-    for (const match of rawHtml.matchAll(/<script\b([^>]*)>/gi)) {
-      const attributes = match[1] || "";
-      const type = String(htmlAttributeValue(attributes, "type") || "").trim().toLowerCase();
-      const moduleScript = type === "module";
-      const classicScript = !type || /(?:java|ecma)script|jscript|livescript/.test(type);
-      // JSON、importmap 等数据脚本不会执行普通 JavaScript，不影响运行时注入顺序。
-      if (!moduleScript && !classicScript) continue;
-      // async 脚本可能在文档解析结束前执行，必须让 Bridge 继续阻塞式抢先安装。
-      if (hasHtmlAttribute(attributes, "async")) return true;
-      if (moduleScript) continue;
-      const deferredExternalScript =
-        htmlAttributeValue(attributes, "src") !== null && hasHtmlAttribute(attributes, "defer");
-      if (!deferredExternalScript) return true;
-    }
-    return false;
-  }
-
   function startupAssetPreloads(rawHtml) {
     const urls = new Set();
     for (const match of rawHtml.matchAll(/<script\b[^>]*\btype=["']module["'][^>]*\bsrc=["']([^"']+)["'][^>]*>/gi)) {
@@ -960,38 +937,35 @@ function createStaticAssetService({
     if (startupPreloads) hitCompatibilityPoint(staticPoints.startupPreload);
     if (previewMarkup) hitCompatibilityPoint(staticPoints.sidebarPreview);
     const useRuntimeBundle = canBundleRuntimeBootstrap();
-    const deferRuntimeScripts = !officialHtmlHasEagerScript(html);
-    const runtimeScript = (src) =>
-      `<script${deferRuntimeScripts ? " defer" : ""} src="${src}"></script>`;
     const runtimeScripts = useRuntimeBundle
       ? [
           '<link rel="preload" as="script" href="/codex-web-config.js">',
           `<link rel="preload" as="script" href="${OPENCODEX_RUNTIME_BOOTSTRAP_PATH}">`,
-          runtimeScript("/codex-web-config.js"),
-          runtimeScript(OPENCODEX_RUNTIME_BOOTSTRAP_PATH),
+          '<script src="/codex-web-config.js"></script>',
+          `<script src="${OPENCODEX_RUNTIME_BOOTSTRAP_PATH}"></script>`,
         ]
       : [
-          runtimeScript("/codex-web-config.js"),
-          runtimeScript(OPENCODEX_MODIFICATION_RUNTIME_PATH),
-          runtimeScript(OPENCODEX_RUNTIME_COMPATIBILITY_PATH),
-          runtimeScript(OPENCODEX_SIDEBAR_PREVIEW_PATH),
-          runtimeScript(OPENCODEX_OFFSCREEN_ANIMATION_GUARD_PATH),
-          runtimeScript(OPENCODEX_PLUGIN_SYSTEM_PATH),
-          runtimeScript(OPENCODEX_PLUGIN_LOADER_PATH),
-          ...[...BUILTIN_PROVIDER_FILES.keys()].map(runtimeScript),
-          runtimeScript(CODEX_SMART_SCHEDULING_INJECTION_HEALTH_PATH),
-          runtimeScript(CODEX_SMART_MODEL_ROUTER_SETTINGS_PATH),
-          runtimeScript(CODEX_SMART_MODEL_ROUTER_COMPOSER_PATH),
-          runtimeScript(CODEX_SMART_SCHEDULING_SUMMARY_PATH),
-          runtimeScript(OPENCODEX_TOKEN_USAGE_CAPABILITY_PATH),
-          runtimeScript(OPENCODEX_WINDOW_CONTROLS_OVERLAY_PATH),
+          '<script src="/codex-web-config.js"></script>',
+          `<script src="${OPENCODEX_MODIFICATION_RUNTIME_PATH}"></script>`,
+          `<script src="${OPENCODEX_RUNTIME_COMPATIBILITY_PATH}"></script>`,
+          `<script src="${OPENCODEX_SIDEBAR_PREVIEW_PATH}"></script>`,
+          `<script src="${OPENCODEX_OFFSCREEN_ANIMATION_GUARD_PATH}"></script>`,
+          `<script src="${OPENCODEX_PLUGIN_SYSTEM_PATH}"></script>`,
+          `<script src="${OPENCODEX_PLUGIN_LOADER_PATH}"></script>`,
+          ...[...BUILTIN_PROVIDER_FILES.keys()].map((url) => `<script src="${url}"></script>`),
+          `<script src="${CODEX_SMART_SCHEDULING_INJECTION_HEALTH_PATH}"></script>`,
+          `<script src="${CODEX_SMART_MODEL_ROUTER_SETTINGS_PATH}"></script>`,
+          `<script src="${CODEX_SMART_MODEL_ROUTER_COMPOSER_PATH}"></script>`,
+          `<script src="${CODEX_SMART_SCHEDULING_SUMMARY_PATH}"></script>`,
+          `<script src="${OPENCODEX_TOKEN_USAGE_CAPABILITY_PATH}"></script>`,
+          `<script src="${OPENCODEX_WINDOW_CONTROLS_OVERLAY_PATH}"></script>`,
           // codec 先于 bridge 执行，确保新版 AppHost 的首批结构化帧可以立即编码。
-          runtimeScript(CODEX_APP_HOST_MESSAGE_CODEC_PATH),
-          runtimeScript(CODEX_BRIDGE_POLYFILL_PATH),
-          runtimeScript(CODEX_REMOTE_FILE_ACTIONS_PATH),
-          runtimeScript(CODEX_WORKSPACE_ROOT_PICKER_PATH),
-          runtimeScript(CODEX_TOOLTIP_DISMISS_GUARD_PATH),
-          runtimeScript(OPENCODEX_MODIFICATION_ACTIVATE_PATH),
+          `<script src="${CODEX_APP_HOST_MESSAGE_CODEC_PATH}"></script>`,
+          `<script src="${CODEX_BRIDGE_POLYFILL_PATH}"></script>`,
+          `<script src="${CODEX_REMOTE_FILE_ACTIONS_PATH}"></script>`,
+          `<script src="${CODEX_WORKSPACE_ROOT_PICKER_PATH}"></script>`,
+          `<script src="${CODEX_TOOLTIP_DISMISS_GUARD_PATH}"></script>`,
+          `<script src="${OPENCODEX_MODIFICATION_ACTIVATE_PATH}"></script>`,
         ];
     // manifest 在 Cloudflare Access 等前置认证后面也必须带同源凭据，否则 Chrome 可能拿不到受保护的 manifest。
     const base = [
@@ -1009,6 +983,7 @@ function createStaticAssetService({
         .join("\n    "),
       OFFICIAL_LOADING_SHIMMER_POWER_GUARD,
       previewMarkup ? sidebarPreviewStyles() : "",
+      `<link id="codex-web-window-controls-overlay-styles" rel="stylesheet" href="${OPENCODEX_WINDOW_CONTROLS_OVERLAY_CSS_PATH}">`,
       `<link id="codex-smart-model-router-settings-styles" rel="stylesheet" href="${CODEX_SMART_MODEL_ROUTER_SETTINGS_CSS_PATH}">`,
       `<link id="codex-smart-scheduling-summary-styles" rel="stylesheet" href="${CODEX_SMART_SCHEDULING_SUMMARY_CSS_PATH}">`,
       `<link id="codex-web-workspace-root-picker-styles" rel="stylesheet" href="${CODEX_WORKSPACE_ROOT_PICKER_CSS_PATH}">`,
@@ -1095,16 +1070,6 @@ function createStaticAssetService({
       .filter((entry) => entry.startsWith(prefix) && entry.endsWith(".css"))
       .sort()[0];
     return fileName ? `/official/assets/${fileName}` : null;
-  }
-
-  /**
-   * 把浏览器解析出的 apps 图标请求映射回官方 webview/apps/ 目录。
-   * 只接受单个图片文件名，避免 /apps/ 变成整个 webview 目录的第二个读入口；
-   * `..` 与 `%2e%2e` 都进不了这条正则，越界路径还会被 locateOfficialAsset 再校验一次。
-   */
-  function locateOfficialAppIcon(relPath) {
-    if (!OFFICIAL_APP_ICON_FILE.test(relPath)) return null;
-    return locateOfficialAsset(`apps/${relPath}`);
   }
 
   function officialAssetFileNames(officialBundle = getOfficialBundle()) {
@@ -1435,6 +1400,35 @@ ${pluginGatewayStateBootstrapScript()}
     return patched;
   }
 
+  function patchProjectRecentSortAppHostQuery(source) {
+    /**
+     * 新版 renderer 把 get-global-state 改走 AppHost httpFetch，旧 Provider 无法再截获 sendMessageFromView。
+     * 这里只在插件声明“最近排序”时把 project-order 的返回值虚拟为空，其它 AppHost RPC 完全透明。
+     */
+    return source
+      .replace(
+        PROJECT_ORDER_APP_HOST_QUERY_RE,
+        (_match, functionName, methodName, paramsName, selectName, signalName, sourceName, resultName, clientName, headerName) =>
+          [
+            `async function ${functionName}(${methodName},${paramsName},${selectName},${signalName},${sourceName}){`,
+            `let ${resultName}=(await ${clientName}.getInstance().post(\`vscode://codex/\${${methodName}}\`,JSON.stringify(${paramsName}),${headerName}(${sourceName}),${signalName})).body;`,
+            `if(globalThis.__OpenCodexProjectRecentSortActive===true&&${methodName}===\`get-global-state\`&&${paramsName}?.key===\`project-order\`){`,
+            `${resultName}={...${resultName},value:[]};globalThis.__OpenCodexProjectRecentSortHit?.()}`,
+            `return ${selectName}?${selectName}(${resultName}):${resultName}}`,
+          ].join("")
+      )
+      .replace(
+        PROJECT_RECENT_GROUP_ORDER_RE,
+        (_match, functionName, groupsName, orderName, sorterName) =>
+          [
+            `function ${functionName}({groups:${groupsName},projectOrder:${orderName}}){`,
+            `let __opencodexGroups=${sorterName}(${groupsName},${orderName});`,
+            // 新版基础分组按旧到新排列；仅最近排序模式翻转，手动顺序仍完全交给官方函数。
+            "return globalThis.__OpenCodexProjectRecentSortActive===true?[...__opencodexGroups].reverse():__opencodexGroups}",
+          ].join("")
+      );
+  }
+
   function patchAppServerRequestScheduling(source) {
     /**
      * 官方调度器会把部分首屏必需读取与耗时的能力清单一起放进 background 队列。
@@ -1454,7 +1448,7 @@ ${pluginGatewayStateBootstrapScript()}
       return source;
     }
 
-    const [, methodVar, paramsVar, optionsVar] = sendMatch;
+    const [, methodVar, paramsVar, optionsVar, enqueueOptions] = sendMatch;
     const coalescedMethods = [
       `${methodVar}===\`app/list\``,
       `${methodVar}===\`mcpServerStatus/list\``,
@@ -1468,7 +1462,7 @@ ${pluginGatewayStateBootstrapScript()}
       `let r=JSON.stringify({method:${methodVar},params:${paramsVar},priority:${optionsVar}?.priority??null,source:${optionsVar}?.source??null,timeoutMs:${optionsVar}?.timeoutMs??0,trace:${optionsVar}?.trace===void 0?\`auto\`:${optionsVar}.trace,widget:${optionsVar}?.widget??null}),`,
       "i=this.opencodexInFlightCapabilityReads.get(r);",
       "if(i!=null)return i;",
-      `let a=this.enqueueRequest(${methodVar},${paramsVar},${optionsVar});`,
+      `let a=this.enqueueRequest(${methodVar},${paramsVar},${enqueueOptions});`,
       "return this.opencodexInFlightCapabilityReads.set(r,a),",
       "a.then(()=>this.opencodexInFlightCapabilityReads.delete(r),()=>this.opencodexInFlightCapabilityReads.delete(r)),a}",
     ].join("");
@@ -1477,7 +1471,7 @@ ${pluginGatewayStateBootstrapScript()}
     return source
       .replace(
         APP_SERVER_REQUEST_CLIENT_FIELDS_RE,
-        "pendingConfigReadRequests=new Map;opencodexInFlightCapabilityReads=new Map;queuedRequests=[]"
+        "pendingConfigReadRequests=new Map;opencodexInFlightCapabilityReads=new Map;"
       )
       .replace(APP_SERVER_REQUEST_CLIENT_SEND_RE, replacement)
       .replace(APP_SERVER_BACKGROUND_METHODS_RE, `new Set([${backgroundMethods}])`);
@@ -1488,11 +1482,20 @@ ${pluginGatewayStateBootstrapScript()}
      * 官方 Pii() 会在插件列表返回后把每个插件的三张摘要图全部读成 base64，即使当前页面完全不可见。
      * 远端 Web 改成同源图片 URL 后，React 数据结构与 fallback 都不变，二进制只在 img 挂载时由浏览器读取。
      */
-    const patched = source.replace(
+    let patched = source.replace(
       PLUGIN_SUMMARY_IMAGE_EAGER_RE,
       (_match, inlineImage, plugin, hostId, queryClient) => {
         const lazyOrInline = (property) =>
           `window.__opencodexPluginImageUrl?.(${plugin}.${property},${hostId})??${inlineImage}(${plugin}.${property},${hostId},${queryClient})`;
+        return `Promise.all([${lazyOrInline("composerIconPath")},${lazyOrInline("logoPath")},${lazyOrInline("logoDarkPath")}])`;
+      }
+    );
+    // 新版官方 bundle 先命中此形狀；必須在 img 掛載前改寫，否則 Chrome 會先記錄 ERR_UNKNOWN_URL_SCHEME。
+    patched = patched.replace(
+      PLUGIN_SUMMARY_IMAGE_RECURSIVE_RE,
+      (_match, inlineImage, plugin, hostId, queryClient, signal) => {
+        const lazyOrInline = (property) =>
+          `window.__opencodexPluginImageUrl?.(${plugin}.${property},${hostId})??${inlineImage}(${plugin}.${property},${hostId},${queryClient},${signal})`;
         return `Promise.all([${lazyOrInline("composerIconPath")},${lazyOrInline("logoPath")},${lazyOrInline("logoDarkPath")}])`;
       }
     );
@@ -1516,10 +1519,22 @@ ${pluginGatewayStateBootstrapScript()}
     return (
       /\/app-server-manager-signals-[^/]+\.js$/.test(reqPath) ||
       data.includes(APPLICATION_MENU_TOKEN) ||
+      data.includes(PROJECT_ORDER_APP_HOST_QUERY_TOKEN) ||
+      data.includes(PROJECT_RECENT_GROUP_ORDER_TOKEN) ||
       data.includes(APP_SERVER_REQUEST_CLIENT_DISPATCH_ERROR) ||
+      data.includes(REGEXP_UNICODE_SETS_PROBE_TOKEN) ||
       (!loopback &&
         (data.includes(OPEN_IN_FOLDER_LOCALE_TOKEN) ||
           (data.includes("composerIconPath") && data.includes("read-file-binary"))))
+    );
+  }
+
+  function patchRegExpUnicodeSetsProbe(source) {
+    if (!source.includes(REGEXP_UNICODE_SETS_PROBE_TOKEN)) return source;
+    // 保持现代浏览器的 v 检测结果；旧浏览器捕获异常后回退为 false，避免初始化阶段整页白屏。
+    return source.replace(
+      REGEXP_UNICODE_SETS_PROBE_TOKEN,
+      "bf.bugNestedClassIgnoresNegation=bf.unicodeSets&&(()=>{try{return RegExp(`[[^a]]`,`v`).test(`a`)}catch{return false}})()"
     );
   }
 
@@ -1535,7 +1550,9 @@ ${pluginGatewayStateBootstrapScript()}
       ? patchHistorySignalsCompatible(source)
       : source;
     patched = patchApplicationMenuCompatible(patched);
+    patched = patchProjectRecentSortAppHostQuery(patched);
     patched = patchRequestSchedulingCompatible(patched);
+    patched = patchRegExpUnicodeSetsProbe(patched);
     if (!loopback) {
       patched = patchPluginImageCompatible(patched);
       patched = patchOpenInFolderLocaleCompatible(patched, options.downloadMessage || downloadFileMessage());
@@ -1558,6 +1575,11 @@ ${pluginGatewayStateBootstrapScript()}
       // assets 目录也用真实路径校验，和官方资源分支保持同一套边界模型。
       if (candidate && isWithinRoot(candidate, WEB_SHELL_ASSETS_DIR)) return candidate;
     }
+    // 官方 renderer 的少数旧资源仍使用根路径（例如 /apps/vscode.png），
+    // 不会经过 /official/ 前缀改写；同样限定在当前官方 webview 根目录内。
+    if (reqPath.startsWith("/apps/")) {
+      return locateOfficialAsset(reqPath.slice(1));
+    }
     if (matchedPatchedOfficialPrefix(reqPath)) {
       const rel = patchedOfficialRelPath(reqPath);
       return locateOfficialAsset(rel);
@@ -1566,9 +1588,6 @@ ${pluginGatewayStateBootstrapScript()}
       const rel = reqPath.slice("/official/".length);
       return locateOfficialAsset(rel);
     }
-    // 官方图标相对路径会带上当前路由前缀，所以按最后一段 apps/<file> 匹配。
-    const appIconMatch = /\/apps\/([^/]+)$/.exec(reqPath);
-    if (appIconMatch) return locateOfficialAppIcon(appIconMatch[1]);
     return null;
   }
 
@@ -1598,8 +1617,6 @@ ${pluginGatewayStateBootstrapScript()}
     if (reqPath.startsWith("/official/assets/")) return "public, max-age=31536000, immutable";
     if (reqPath.startsWith(WEB_SHELL_ASSETS_PREFIX)) return "public, max-age=86400";
     if (reqPath.startsWith("/official/")) return "public, max-age=3600";
-    // 图标名不带 content hash，只做短期缓存，升级换图标后最多一小时内自行刷新。
-    if (/\/apps\/[^/]+\.(?:png|svg|webp|avif|ico|jpe?g|gif)$/i.test(reqPath)) return "public, max-age=3600";
     if (WEB_SHELL_STATIC_FILES.has(reqPath) || reqPath.startsWith(OPENCODEX_PLUGIN_URL_PREFIX)) {
       // 文件名不带 hash，必须每次验证；内容未变时允许 304，避免远端刷新重复传输整套 Web 扩展脚本。
       return "private, no-cache, must-revalidate";

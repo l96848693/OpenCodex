@@ -7,6 +7,7 @@ const { openFileTargetFromIpc } = require("../runtime/ipc/open-file-context.cjs"
 const {
   createIpcFrameParser,
   createOfficialLiveObserver,
+  createOfficialMobileStreamProjector,
   encodeIpcFrame,
   __test: observerTest,
 } = require("../runtime/ipc/official-live-observer.cjs");
@@ -64,14 +65,174 @@ function threadStreamStateMessage(conversationId, sourceClientId, change) {
   };
 }
 
+test("official mobile projector exposes an active canonical turn and visible items", () => {
+  const published = [];
+  const projector = createOfficialMobileStreamProjector({ publish: (event) => published.push(event) });
+  projector.consume(threadStreamStateMessage("thread-mobile", "desktop-owner", {
+    type: "snapshot",
+    revision: 7,
+    conversationState: {
+      threadRuntimeStatus: { type: "active" },
+      turnHistory: {
+        kind: "canonical",
+        history: {
+          entitiesByKey: {
+            "tail:0:local:active": {
+              turnId: "turn-active",
+              status: "inProgress",
+              turnStartedAtMs: 100,
+              items: [
+                { id: "reasoning-one", type: "reasoning", summary: ["检查紧"] },
+                { id: "message-one", type: "agentMessage", text: "处理中" },
+              ],
+            },
+          },
+        },
+      },
+    },
+  }));
+
+  assert.deepEqual(published, [
+    { type: "thread.turn.state", threadId: "thread-mobile", payload: { turnId: "turn-active", status: "streaming" } },
+    { type: "thread.message.delta", threadId: "thread-mobile", payload: { turnId: "turn-active", itemId: "reasoning-one", kind: "reasoning", delta: "检查紧" } },
+    { type: "thread.message.delta", threadId: "thread-mobile", payload: { turnId: "turn-active", itemId: "message-one", kind: "message", delta: "处理中" } },
+  ]);
+});
+
+test("official mobile projector lets active runtime override a stale stopped turn", () => {
+  const published = [];
+  const projector = createOfficialMobileStreamProjector({ publish: (event) => published.push(event) });
+  projector.consume(threadStreamStateMessage("thread-mobile", "desktop-owner", {
+    type: "snapshot",
+    revision: 8,
+    conversationState: {
+      threadRuntimeStatus: { type: "active" },
+      turnHistory: { kind: "canonical", history: { entitiesByKey: {
+        "tail:0:local:active": {
+          turnId: "turn-active",
+          status: "stopped",
+          turnStartedAtMs: 200,
+          items: [{ id: "message-live", type: "agentMessage", text: "仍在处理" }],
+        },
+      } } },
+    },
+  }));
+
+  assert.deepEqual(published, [
+    { type: "thread.turn.state", threadId: "thread-mobile", payload: { turnId: "turn-active", status: "streaming" } },
+    { type: "thread.message.delta", threadId: "thread-mobile", payload: { turnId: "turn-active", itemId: "message-live", kind: "message", delta: "仍在处理" } },
+  ]);
+});
+
+test("official mobile projector preserves commentary phase and process kind", () => {
+  const published = [];
+  const projector = createOfficialMobileStreamProjector({ publish: (event) => published.push(event) });
+  projector.consume(threadStreamStateMessage("thread-phase", "desktop-owner", {
+    type: "snapshot",
+    revision: 9,
+    conversationState: {
+      threadRuntimeStatus: { type: "active" },
+      turnHistory: { kind: "canonical", history: { entitiesByKey: {
+        "tail:0:local:active": {
+          turnId: "turn-phase",
+          status: "stopped",
+          items: [
+            { id: "message-commentary", type: "agentMessage", phase: "commentary", text: "处理中" },
+            { id: "message-final", type: "agentMessage", phase: "final_answer", text: "完成" },
+          ],
+        },
+      } } },
+    },
+  }));
+
+  assert.deepEqual(published, [
+    { type: "thread.turn.state", threadId: "thread-phase", payload: { turnId: "turn-phase", status: "streaming" } },
+    { type: "thread.message.delta", threadId: "thread-phase", payload: { turnId: "turn-phase", itemId: "message-commentary", kind: "reasoning", delta: "处理中", phase: "commentary" } },
+    { type: "thread.message.delta", threadId: "thread-phase", payload: { turnId: "turn-phase", itemId: "message-final", kind: "message", delta: "完成", phase: "final_answer" } },
+  ]);
+});
+
+test("official mobile projector delays a stale terminal state until runtime becomes inactive", () => {
+  const published = [];
+  const projector = createOfficialMobileStreamProjector({ publish: (event) => published.push(event) });
+  projector.consume(threadStreamStateMessage("thread-mobile", "desktop-owner", {
+    type: "snapshot",
+    revision: 20,
+    conversationState: {
+      threadRuntimeStatus: { type: "active" },
+      turnHistory: { kind: "canonical", history: { entitiesByKey: {
+        "tail:0:local:active": { turnId: "turn-active", status: "inProgress", turnStartedAtMs: 300, items: [] },
+      } } },
+    },
+  }));
+  published.length = 0;
+
+  projector.consume(threadStreamStateMessage("thread-mobile", "desktop-owner", {
+    type: "patches",
+    baseRevision: 20,
+    revision: 21,
+    patches: [
+      { op: "replace", path: "/turnHistory/history/entitiesByKey/tail:0:local:active/status", value: "stopped" },
+    ],
+  }));
+  assert.deepEqual(published, []);
+
+  projector.consume(threadStreamStateMessage("thread-mobile", "desktop-owner", {
+    type: "patches",
+    baseRevision: 21,
+    revision: 22,
+    patches: [
+      { op: "replace", path: "/threadRuntimeStatus/type", value: "idle" },
+    ],
+  }));
+  assert.deepEqual(published, [
+    { type: "thread.turn.state", threadId: "thread-mobile", payload: { turnId: "turn-active", status: "cancelled" } },
+  ]);
+});
+
+test("official mobile projector applies Immer patches as deltas and terminal state", () => {
+  const published = [];
+  const projector = createOfficialMobileStreamProjector({ publish: (event) => published.push(event) });
+  projector.consume(threadStreamStateMessage("thread-mobile", "desktop-owner", {
+    type: "snapshot",
+    revision: 10,
+    conversationState: {
+      turnHistory: { kind: "canonical", history: { entitiesByKey: {
+        "tail:0:local:active": { turnId: "turn-active", status: "inProgress", items: [
+          { id: "message-one", type: "agentMessage", text: "处理" },
+        ] },
+      } } },
+    },
+  }));
+  published.length = 0;
+  projector.consume(threadStreamStateMessage("thread-mobile", "desktop-owner", {
+    type: "patches",
+    baseRevision: 10,
+    revision: 11,
+    patches: [
+      { op: "replace", path: "/turnHistory/history/entitiesByKey/tail:0:local:active/items/0/text", value: "处理中" },
+      { op: "replace", path: "/turnHistory/history/entitiesByKey/tail:0:local:active/status", value: "completed" },
+    ],
+  }));
+
+  assert.deepEqual(published, [
+    { type: "thread.message.delta", threadId: "thread-mobile", payload: { turnId: "turn-active", itemId: "message-one", kind: "message", delta: "中" } },
+    { type: "thread.turn.state", threadId: "thread-mobile", payload: { turnId: "turn-active", status: "completed" } },
+  ]);
+});
+
 test("bridges only the primary official renderer to the Web client", () => {
   const primary = { id: 1, isDestroyed: () => false };
   const samePrimaryWrapper = { id: 1, isDestroyed: () => false };
   const auxiliary = { id: 2, isDestroyed: () => false };
+  const replacementPrimary = { id: 3, isDestroyed: () => false, __opencodexOfficialPrimary: true };
 
   assert.equal(__test.shouldBridgeOfficialWebContents(primary, null), true);
   assert.equal(__test.shouldBridgeOfficialWebContents(samePrimaryWrapper, primary), true);
   assert.equal(__test.shouldBridgeOfficialWebContents(auxiliary, primary), false);
+  // 尺寸標記唔可以令 auxiliary/overlay 搶走仍然存活嘅 primary；只有 primary
+  // 已銷毀先容許下一扇窗口接管，避免官方 AppHost 報 Primary renderer was replaced。
+  assert.equal(__test.shouldBridgeOfficialWebContents(replacementPrimary, primary), false);
   assert.equal(
     __test.shouldBridgeOfficialWebContents(auxiliary, { id: 1, isDestroyed: () => true }),
     true
