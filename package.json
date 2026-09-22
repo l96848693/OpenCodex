@@ -26,8 +26,8 @@
     "launcher:dev": "pnpm run build && pnpm exec electron .",
     "launcher:pack:mac": "pnpm run build && pnpm exec electron-builder --mac --dir",
     "launcher:dist:mac": "pnpm run build && pnpm exec electron-builder --mac dmg zip --x64 --arm64",
-    "launcher:pack:win": "pnpm run build && pnpm exec electron-builder --win --dir --x64",
-    "launcher:dist:win": "pnpm run build && pnpm exec electron-builder --win nsis zip --x64",
+    "launcher:pack:win": "pnpm run build && pnpm exec electron-builder --win --dir --x64 --arm64 --ia32",
+    "launcher:dist:win": "pnpm run build && pnpm exec electron-builder --win nsis zip --x64 --arm64 --ia32",
     "launcher:pack:linux": "pnpm run build && pnpm exec electron-builder --linux --dir --x64",
     "launcher:dist:linux": "pnpm run build && pnpm exec electron-builder --linux AppImage deb zip --x64"
   },
@@ -50,7 +50,7 @@
     "@types/ws": "^8.18.1",
     "@vitejs/plugin-react": "^6.1.1",
     "electron": "42.0.1",
-    "electron-builder": "^26.0.12",
+    "electron-builder": "^26.15.3",
     "esbuild": "^0.25.12",
     "typescript": "^5.9.3",
     "vite": "^8.2.2"
@@ -101,17 +101,22 @@
       ]
     },
     "win": {
+      "artifactName": "${productName}-${version}-${arch}.${ext}",
       "target": [
         {
           "target": "nsis",
           "arch": [
-            "x64"
+            "x64",
+            "arm64",
+            "ia32"
           ]
         },
         {
           "target": "zip",
           "arch": [
-            "x64"
+            "x64",
+            "arm64",
+            "ia32"
           ]
         }
       ]

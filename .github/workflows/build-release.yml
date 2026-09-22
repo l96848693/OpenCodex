@@ -106,8 +106,15 @@ jobs:
           if-no-files-found: error
 
   build-windows:
-    name: Build Windows installer
+    name: Build Windows installer (${{ matrix.arch }})
     needs: metadata
+    strategy:
+      fail-fast: false
+      matrix:
+        arch:
+          - x64
+          - arm64
+          - ia32
     runs-on: windows-latest
     steps:
       - name: Checkout repository
@@ -132,14 +139,14 @@ jobs:
         run: |
           pnpm run build
           # 安装包由后续 job 统一发布，禁止 electron-builder 在 CI 中自动上传。
-          pnpm exec electron-builder --win nsis --x64 --publish never
+          pnpm exec electron-builder --win nsis --${{ matrix.arch }} --publish never
 
       - name: Upload Windows artifact
         uses: actions/upload-artifact@v6
         with:
-          # 外层 Artifact 名称携带完整提交哈希，内部 EXE 文件名保持不变。
-          name: opencodex-windows-${{ github.sha }}
-          path: release/*.exe
+          # Artifact 同安装包文件名都带架构，合并下载时唔会互相覆盖。
+          name: opencodex-windows-${{ matrix.arch }}-${{ github.sha }}
+          path: release/*-${{ matrix.arch }}.exe
           if-no-files-found: error
 
   release:
@@ -171,11 +178,19 @@ jobs:
           dmg_files=(release-assets/*.dmg)
           exe_files=(release-assets/*.exe)
 
-          # 当前配置应产出 Intel/Apple Silicon 两个 DMG 和一个 Windows 安装包。
-          if (( ${#dmg_files[@]} != 2 || ${#exe_files[@]} != 1 )); then
+          # 当前配置应产出 Intel/Apple Silicon 两个 DMG 和三个 Windows 架构安装包。
+          if (( ${#dmg_files[@]} != 2 || ${#exe_files[@]} != 3 )); then
             echo "Unexpected assets: ${#dmg_files[@]} DMG, ${#exe_files[@]} EXE" >&2
             exit 1
           fi
+
+          for arch in x64 arm64 ia32; do
+            matching_files=(release-assets/*-"$arch".exe)
+            if (( ${#matching_files[@]} != 1 )); then
+              echo "Unexpected Windows $arch installers: ${#matching_files[@]}" >&2
+              exit 1
+            fi
+          done
 
       - name: Create or update draft release
         shell: bash

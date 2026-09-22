@@ -10,6 +10,8 @@
 2. 增加：重点强化 Windows Gateway、Android Mobile Web 及 Samsung Galaxy S20／S20 Ultra 适配稳定性。
 3. 修复：移动 Web 打开项目时不会覆盖项目原有的自定义模型；用户未主动选择模型前会沿用当前会话配置。
 4. 说明：本版本暂未测试 macOS、iOS Safari 及其他 Apple 原生浏览器环境。
+5. 修復（3.0.0 補丁）：升級 electron-builder 至 26.15.3，修正 macOS Electron framework 符號鏈接清理失敗。
+6. 增加（3.0.0 補丁）：Windows CI 加入 x64、arm64、ia32 構建矩陣，並按架構校驗 Release 產物。
 
 ----v2.1.1----
 
