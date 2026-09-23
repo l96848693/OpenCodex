@@ -130,7 +130,10 @@ jobs:
         run: |
           pnpm run build
           # 安装包由后续 job 统一发布，禁止 electron-builder 在 CI 中自动上传。
-          pnpm exec electron-builder --mac dmg --${{ matrix.arch }} --publish never
+          pnpm exec electron-builder --mac dmg --${{ matrix.arch }} \
+            --config.mac.identity=- \
+            --config.mac.hardenedRuntime=false \
+            --publish never
 
       - name: Verify macOS signatures
         shell: bash
