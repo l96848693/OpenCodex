@@ -203,13 +203,18 @@ jobs:
           pnpm run build
           # 安装包由后续 job 统一发布，禁止 electron-builder 在 CI 中自动上传。
           pnpm exec electron-builder --win nsis --${{ matrix.arch }} --publish never
+          # Electron Builder 内部使用 ia32；Release 对用户显示更易理解的 x86。
+          if ("${{ matrix.arch }}" -eq "ia32") {
+            Get-ChildItem -LiteralPath release -Filter "*-ia32.exe" |
+              Rename-Item -NewName { $_.Name -replace "-ia32\.exe$", "-x86.exe" }
+          }
 
       - name: Upload Windows artifact
         uses: actions/upload-artifact@v6
         with:
           # Artifact 同安装包文件名都带架构，合并下载时唔会互相覆盖。
           name: opencodex-windows-${{ matrix.arch }}-${{ github.sha }}
-          path: release/*-${{ matrix.arch }}.exe
+          path: release/*.exe
           if-no-files-found: error
 
   release:
@@ -247,7 +252,8 @@ jobs:
             exit 1
           fi
 
-          for arch in x64 arm64 ia32; do
+          # 对外 Release 使用 x86；构建矩阵内部仍使用 electron-builder 的 ia32。
+          for arch in x64 arm64 x86; do
             matching_files=(release-assets/*-"$arch".exe)
             if (( ${#matching_files[@]} != 1 )); then
               echo "Unexpected Windows $arch installers: ${#matching_files[@]}" >&2
