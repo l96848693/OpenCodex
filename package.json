@@ -78,6 +78,8 @@
       "gateway/runtime/**/*",
       "gateway/dist/**/*",
       "node_modules/**/*",
+      "!node_modules/electron",
+      "!node_modules/electron/**/*",
       "web-shell/**/*"
     ],
     "mac": {
