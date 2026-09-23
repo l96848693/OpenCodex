@@ -12,6 +12,7 @@
 4. 说明：本版本暂未测试 macOS、iOS Safari 及其他 Apple 原生浏览器环境。
 5. 修復（3.0.0 補丁）：升級 electron-builder 至 26.15.3，修正 macOS Electron framework 符號鏈接清理失敗。
 6. 增加（3.0.0 補丁）：Windows CI 加入 x64、arm64、ia32 構建矩陣，並按架構校驗 Release 產物。
+7. 增加（3.0.0 補丁）：對外安裝包名稱統一加入平台標識，使用 `mac-x64`、`mac-arm64`、`win-x64`、`win-arm64`、`win-x86`，唔再只靠副檔名分辨平台。
 
 ----v2.1.1----
 

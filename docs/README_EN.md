@@ -4,6 +4,8 @@
 
 [繁體中文（粵語）](../README.md) | [简体中文](README_CN.md) | **English** | [Release notes](NEWS.md)
 
+Release notes: see [NEWS.md](NEWS.md) for additions, fixes, and release information listed by version.
+
 OpenCodex is a middleware layer between the Codex desktop runtime and the browser. It supports legacy Codex Desktop and the newer ChatGPT Desktop runtime, allowing you to operate Codex on a target computer from a phone, tablet, or another computer without staying at the desk.
 
 ---
@@ -32,6 +34,13 @@ OpenCodex remains useful in several scenarios:
 - Load built-in and external ESM plugins on PC Web through Plugin SDK v2.
 - The tested scope is primarily the Windows Gateway, Android Mobile Web, and Samsung Galaxy S20/S20 Ultra; this version is hardened for those environments.
 - macOS, Safari (including iOS Safari), and other Apple-native browsers have not been tested, so compatibility is not guaranteed.
+
+## Project origin and release notes
+
+- This repository is maintained independently by Colleen. Source, license, and release-note links are listed at the top; the project evolves from [RyensX/OpenCodex](https://github.com/RyensX/OpenCodex), with thanks to the original author and upstream contributors.
+- GitHub Actions uses the change scope: pushes that only modify the root `README.md` or files under `docs/` keep validation but skip Windows/macOS installer builds; source changes and version-release commits still run the complete build.
+- Windows releases use explicit `win-x64`, `win-arm64`, and `win-x86` filenames; macOS uses `mac-x64` and `mac-arm64` DMG filenames. x64 is the primary tested target, while the other architectures depend on CI results and target-device validation.
+- The launcher prefers an installed OpenCodex PWA and falls back to a regular browser; official runtime updates retain the previous bundle as a backup that can be restored from the launcher when needed.
 
 ## Requirements
 

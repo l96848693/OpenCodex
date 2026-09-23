@@ -136,6 +136,11 @@ jobs:
           # 安装包由后续 job 统一发布，禁止 electron-builder 在 CI 中自动上传。
           pnpm exec electron-builder --mac dmg --${{ matrix.arch }} \
             --publish never
+          # 对外文件名统一带 mac 平台标识，避免用户仅靠扩展名猜平台。
+          for dmg in release/*-${{ matrix.arch }}.dmg; do
+            base="${dmg%-${{ matrix.arch }}.dmg}"
+            mv "$dmg" "${base}-mac-${{ matrix.arch }}.dmg"
+          done
 
       - name: Verify macOS signatures
         shell: bash
@@ -203,11 +208,10 @@ jobs:
           pnpm run build
           # 安装包由后续 job 统一发布，禁止 electron-builder 在 CI 中自动上传。
           pnpm exec electron-builder --win nsis --${{ matrix.arch }} --publish never
-          # Electron Builder 内部使用 ia32；Release 对用户显示更易理解的 x86。
-          if ("${{ matrix.arch }}" -eq "ia32") {
-            Get-ChildItem -LiteralPath release -Filter "*-ia32.exe" |
-              Rename-Item -NewName { $_.Name -replace "-ia32\.exe$", "-x86.exe" }
-          }
+          # Electron Builder 内部使用 ia32；Release 对用户显示更易理解的 x86，且统一带 win 平台标识。
+          $releaseArch = if ("${{ matrix.arch }}" -eq "ia32") { "x86" } else { "${{ matrix.arch }}" }
+          Get-ChildItem -LiteralPath release -Filter "*.exe" |
+            Rename-Item -NewName { $_.Name -replace "-${{ matrix.arch }}\.exe$", "-win-$releaseArch.exe" }
 
       - name: Upload Windows artifact
         uses: actions/upload-artifact@v6
@@ -254,9 +258,17 @@ jobs:
 
           # 对外 Release 使用 x86；构建矩阵内部仍使用 electron-builder 的 ia32。
           for arch in x64 arm64 x86; do
-            matching_files=(release-assets/*-"$arch".exe)
+            matching_files=(release-assets/*-win-"$arch".exe)
             if (( ${#matching_files[@]} != 1 )); then
               echo "Unexpected Windows $arch installers: ${#matching_files[@]}" >&2
+              exit 1
+            fi
+          done
+
+          for arch in x64 arm64; do
+            matching_files=(release-assets/*-mac-"$arch".dmg)
+            if (( ${#matching_files[@]} != 1 )); then
+              echo "Unexpected macOS $arch installers: ${#matching_files[@]}" >&2
               exit 1
             fi
           done

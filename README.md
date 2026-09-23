@@ -4,6 +4,8 @@
 
 **繁體中文（粵語）** | [简体中文](docs/README_CN.md) | [English](docs/README_EN.md) | [版本消息](docs/NEWS.md)
 
+版本消息：请查看 [docs/NEWS.md](docs/NEWS.md)，每个版本的新增、修复及发布说明都会按版本号追加。
+
 OpenCodex 係一層連接 Codex 桌面運行時同瀏覽器嘅中間層，兼容舊版 Codex Desktop 同新版 ChatGPT Desktop。你可以用手機、平板或者另一部電腦，透過瀏覽器操作目標電腦上嘅 Codex，唔使長期坐喺電腦前面都可以繼續 AI Coding。
 
 ---
@@ -32,6 +34,13 @@ ChatGPT App 對大陸 Android 生態唔友好，所以我決定企喺巨人膊�
 - 內置 Plugin SDK v2；PC Web 可以載入內置或外部 ESM 插件。
 - 實際測試範圍主要係 Windows Gateway、Android Mobile Web，以及 Samsung Galaxy S20／S20 Ultra；本版本亦針對呢幾類環境強化穩定性。
 - macOS、Safari（包括 iOS Safari）同其他 Apple 原生瀏覽器目前未有測試，因此唔保證兼容性。
+
+## 項目來源與發布說明
+
+- 呢個倉庫由 Colleen 獨立維護，源碼、授權同版本消息入口放喺頁面最上方；項目基於 [RyensX/OpenCodex](https://github.com/RyensX/OpenCodex) 演進，特此致謝原作者同上游貢獻者。
+- GitHub Actions 會照改動範圍處理：只改根目錄 `README.md` 或 `docs/` 文檔時，會保留檢查但跳過 Windows／macOS 安裝包構建；源碼改動同版本發布提交仍會執行完整構建。
+- Windows Release 會按 `win-x64`、`win-arm64`、`win-x86` 分開產出安裝包；macOS 會按 `mac-x64`、`mac-arm64` 產出 DMG。x64 係主要實測目標，其他架構以 CI 構建結果同目標設備驗證為準。
+- 啟動器會優先開啟已安裝嘅 OpenCodex PWA，搵唔到先退回普通瀏覽器；官方 runtime 更新前會保留上一版本備份，必要時可以喺啟動器還原。
 
 ## 環境要求
 
