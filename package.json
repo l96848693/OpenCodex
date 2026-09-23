@@ -36,7 +36,6 @@
     "@tanstack/react-query": "^5.102.8",
     "balanced-match": "^4.0.2",
     "brace-expansion": "^5.0.6",
-    "opencodex": "link:",
     "react": "^19.2.8",
     "react-dom": "^19.2.8",
     "react-router-dom": "^7.18.3",
