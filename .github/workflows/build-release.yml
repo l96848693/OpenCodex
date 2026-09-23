@@ -124,15 +124,14 @@ jobs:
       - name: Build unsigned DMG installers
         env:
           # GitHub-hosted runners do not contain a distributable Apple signing
-          # identity. Disable auto-discovery so electron-builder does not fail
-          # while cleaning a partial Squirrel framework from its cache.
+          # identity. The package config explicitly uses identity=null so CI
+          # skips macOS signing and avoids touching signing-only framework
+          # symlinks on GitHub-hosted runners.
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
         run: |
           pnpm run build
           # 安装包由后续 job 统一发布，禁止 electron-builder 在 CI 中自动上传。
           pnpm exec electron-builder --mac dmg --${{ matrix.arch }} \
-            --config.mac.identity=- \
-            --config.mac.hardenedRuntime=false \
             --publish never
 
       - name: Verify macOS signatures
