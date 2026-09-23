@@ -119,7 +119,10 @@ jobs:
           cache: pnpm
 
       - name: Install dependencies
-        run: pnpm install --frozen-lockfile
+        # macOS 打包会遍历 node_modules；pnpm 默认 symlink 布局会令
+        # electron-builder 复制 Electron framework 的 Versions/Current 链时失败。
+        # hoisted 布局保留 lockfile 约束，但避免这条 macOS symlink 链。
+        run: pnpm install --frozen-lockfile --config.node-linker=hoisted
 
       - name: Build unsigned DMG installers
         env:
